@@ -1,0 +1,3 @@
+# warp-setup build deps
+requests>=2.31
+pyinstaller>=6.0
