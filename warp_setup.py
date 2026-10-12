@@ -163,6 +163,32 @@ def install_msi(msi_path):
     except EOFError:
         time.sleep(10)
 
+def open_warp_gui():
+    """Open the WARP window (GUI panel) so the user can press Connect manually."""
+    try:
+        task = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Cloudflare WARP.exe"],
+                              capture_output=True, text=True, timeout=15)
+        if "Cloudflare WARP.exe" in (task.stdout or ""):
+            log("WARP GUI already running - bringing window to front...")
+            for g in WARP_GUI_CANDIDATES:
+                if g and os.path.isfile(g):
+                    try:
+                        os.startfile(g)  # type: ignore[attr-defined]
+                    except Exception:
+                        subprocess.Popen([g])
+                    break
+            return True
+        for g in WARP_GUI_CANDIDATES:
+            if g and os.path.isfile(g):
+                log("Opening WARP GUI window: %s" % g)
+                subprocess.Popen([g])
+                return True
+        log("WARP GUI exe not found - user must open WARP manually.")
+        return False
+    except Exception as e:
+        log("open GUI failed: %s" % e)
+        return False
+
 def ensure_warp_running(warp_cli):
     code, out = run(["sc", "query", "warp-svc"], timeout=15)
     log("service warp-svc query rc=%s" % code)
@@ -243,6 +269,9 @@ def main():
     print("=" * 60)
     log("diag log: %s" % DIAG_LOG)
     log("admin: %s" % is_admin())
+    print("\n[0/5] Opening WARP window ...")
+    print(">>> WARP window should pop up now - press Connect/ON there if needed. <<<")
+    open_warp_gui()
     ip_before = None
     try:
         ip_before, src0 = get_public_ip()
