@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenCode NoLimits (v3.0) — High-Performance Background Tunnel & Limit Auto-Reset
-================================================================================
-- Automatic Administrator (UAC) elevation.
-- Single-instance enforcement: closes previous instances/windows automatically.
-- Permanently suppresses Cloudflare taskbar icon & disables Windows startup entries.
-- Enforces WireGuard tunnel protocol (zero UDP packet loss, restores direct cable speed).
-- Fast endpoint rotation and automated OpenCode DeepSeek free limit unlocking.
-- Active Watcher (Continuous Listener): auto-heals and renews tunnel if it drops.
-- Clean Teardown: closing the terminal/Ctrl+C gracefully terminates the tunnel.
-- Preserves all user chats and projects completely intact.
+OpenCode NoLimits (v3.5) — Ultra-Fast Tunnel & Limit Reset Tool
+================================================================
+- Single-instance enforcement (safely excludes parent bootloader).
+- Console window is permanently visible and never disappears.
+- Suppresses Cloudflare WARP tray icon & disables Windows startup.
+- Enforces WireGuard tunnel protocol (fixes UDP packet loss & restores direct cable icon).
+- Fast endpoint rotation and automated OpenCode DeepSeek quota check.
+- Active Sentinel Mode (continuous background monitoring and auto-recovery).
+- Clean Teardown: closing the window (X) or Ctrl+C terminates tunnel gracefully.
+- Preserves all previous OpenCode chats and projects.
 """
 
 import atexit
@@ -23,7 +23,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.request
 import urllib.error
@@ -58,7 +57,6 @@ IP_SERVICES = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanh
 CONNECT_TIMEOUT_SEC = 8
 DIAG_LOG = os.path.join(tempfile.gettempdir(), "warp_setup_diag.log")
 
-# Global state for clean teardown
 _G_WARP_CLI = None
 _G_SHUTDOWN_TRIGGERED = False
 
@@ -79,7 +77,7 @@ def is_admin():
 
 
 def request_admin_elevation():
-    """Relaunch the current process with Administrator privileges if not elevated."""
+    """Relaunch the current process with Administrator privileges if needed."""
     if is_admin():
         return True
     try:
@@ -99,12 +97,20 @@ def request_admin_elevation():
         return False
 
 
-def disable_cloudflare_startup_and_tray():
+def cleanup_old_instances():
     """
-    Remove Cloudflare WARP from Windows auto-startup and kill the tray process.
-    Prevents Cloudflare from ever sitting in the taskbar or launching on boot.
+    Safely terminate older WarpSetup instances:
+    Crucial: Must NOT terminate current PID or parent PID (PyInstaller bootloader),
+    which was previously causing the console window to suddenly close.
     """
-    # 1. Kill Cloudflare WARP tray GUI immediately
+    my_pid = os.getpid()
+    parent_pid = 0
+    try:
+        parent_pid = os.getppid()
+    except Exception:
+        pass
+
+    # 1. Silently kill Cloudflare WARP GUI if open
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         subprocess.run(["taskkill", "/F", "/T", "/IM", "Cloudflare WARP.exe"],
@@ -112,7 +118,26 @@ def disable_cloudflare_startup_and_tray():
     except Exception:
         pass
 
-    # 2. Remove from Registry Auto-Run
+    # 2. Terminate older WarpSetup instances safely
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        p = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WarpSetup.exe", "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True, creationflags=creationflags, timeout=3)
+        for line in p.stdout.strip().splitlines():
+            parts = [col.strip('"') for col in line.split(",")]
+            if len(parts) >= 2 and parts[1].isdigit():
+                pid = int(parts[1])
+                # Exclude self and bootloader parent
+                if pid != my_pid and pid != parent_pid:
+                    log(f"Terminating older WarpSetup instance (PID: {pid})")
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True, creationflags=creationflags, timeout=2)
+    except Exception as e:
+        log(f"Instance cleanup error: {e}")
+
+
+def disable_cloudflare_startup_and_tray():
+    """Remove Cloudflare from Windows auto-run registry keys."""
     try:
         import winreg
         paths = [
@@ -125,7 +150,6 @@ def disable_cloudflare_startup_and_tray():
                     for val_name in ["CloudflareWARP", "Cloudflare WARP", "CloudflareOne"]:
                         try:
                             winreg.DeleteValue(key, val_name)
-                            log(f"Removed startup entry: {val_name}")
                         except FileNotFoundError:
                             pass
             except Exception:
@@ -134,26 +158,7 @@ def disable_cloudflare_startup_and_tray():
         log(f"Startup registry cleanup error: {e}")
 
 
-def cleanup_old_instances():
-    """Single-instance enforcement: close previous WarpSetup processes/windows."""
-    my_pid = os.getpid()
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    try:
-        p = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WarpSetup.exe", "/FO", "CSV", "/NH"],
-                           capture_output=True, text=True, creationflags=creationflags, timeout=3)
-        for line in p.stdout.strip().splitlines():
-            parts = [col.strip('"') for col in line.split(",")]
-            if len(parts) >= 2 and parts[1].isdigit():
-                pid = int(parts[1])
-                if pid != my_pid:
-                    log(f"Terminating older WarpSetup instance (PID: {pid})")
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                                   capture_output=True, creationflags=creationflags, timeout=2)
-    except Exception as e:
-        log(f"Instance cleanup error: {e}")
-
-
-def run(cmd, timeout=10):
+def run(cmd, timeout=8):
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=creationflags)
@@ -204,7 +209,7 @@ def wait_for_connection_fast(warp_cli, timeout=CONNECT_TIMEOUT_SEC):
 def get_public_ip_fast():
     for url in IP_SERVICES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "warp-setup/3.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "warp-setup/3.5"})
             with urllib.request.urlopen(req, timeout=3.0) as r:
                 ip = r.read().decode("utf-8", "replace").strip()
                 ip = ip.split()[0] if ip else ""
@@ -216,7 +221,7 @@ def get_public_ip_fast():
 
 
 def execute_cycle(warp_cli, endpoint=None, delete_registration=False):
-    """Executes a silent, rapid renewal and reconnection cycle."""
+    """Silent, rapid identity renewal and endpoint rotation."""
     run([warp_cli, "--accept-tos", "disconnect"], timeout=4)
 
     if delete_registration:
@@ -236,7 +241,7 @@ def execute_cycle(warp_cli, endpoint=None, delete_registration=False):
 
 
 def verify_opencode_deepseek():
-    """Probe OpenCode free inference endpoint for deepseek-v4.1-flash-free."""
+    """Direct probe to OpenCode free inference API for deepseek-v4.1-flash-free."""
     url = "https://opencode.ai/inference/openai/v1/chat/completions"
     data = {
         "model": "deepseek-v4.1-flash-free",
@@ -265,14 +270,14 @@ def verify_opencode_deepseek():
 
 
 def shutdown_tunnel():
-    """Graceful teardown: disconnect tunnel so everything cleanly reverts upon exit."""
+    """Teardown on exit: ensures the tunnel dies with the terminal."""
     global _G_SHUTDOWN_TRIGGERED, _G_WARP_CLI
     if _G_SHUTDOWN_TRIGGERED:
         return
     _G_SHUTDOWN_TRIGGERED = True
 
     print("\n\n" + "─" * 60)
-    print("  [!] جاري إغلاق نفق الشبكة وإعادة الاتصال لحالته الطبيعية...")
+    print("  [!] تم رصد إغلاق النافذة: جاري قطع النفق وإرجاع الشبكة...")
     print("─" * 60)
 
     if _G_WARP_CLI:
@@ -284,21 +289,19 @@ def shutdown_tunnel():
             pass
 
     disable_cloudflare_startup_and_tray()
-    print("  [✓] تم إنهاء النفق بنجاح. وداعاً!\n")
+    print("  [✓] تم إغلاق النفق بنجاح.\n")
 
 
 def setup_exit_handlers():
-    """Register exit handlers for Ctrl+C, window close button (X), and normal exit."""
+    """Handle Ctrl+C, system shutdown, and console window close button (X)."""
     atexit.register(shutdown_tunnel)
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
 
     if sys.platform == "win32":
-        # Handle Windows Console Close button (X)
         PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
 
         def win_ctrl_handler(ctrl_type):
-            # 0: CTRL_C, 2: CTRL_CLOSE, 5: LOGOFF, 6: SHUTDOWN
             shutdown_tunnel()
             return True
 
@@ -308,7 +311,7 @@ def setup_exit_handlers():
 
 
 def run_renewal_routine(warp_cli):
-    """Executes the IP rotation sequence until a working OpenCode quota is verified."""
+    """Rotate endpoints until a clean, unlocked IP is obtained."""
     print("  [1/2] جاري تدوير الـ IP وفك الليمت عبر WireGuard السريع...", flush=True)
 
     for idx, ep in enumerate(ROTATION_ENDPOINTS):
@@ -335,7 +338,6 @@ def run_renewal_routine(warp_cli):
         print(f"        × الـ IP ({ip}) ما زال مقيداً، تدوير مباشر إلى سيرفر آخر...", flush=True)
         time.sleep(0.3)
 
-    # Return current state if all cycles completed
     return False, get_public_ip_fast()
 
 
@@ -352,14 +354,12 @@ def print_success_card(ip):
 
 
 def active_sentinel_loop(warp_cli, current_ip):
-    """
-    Continuous background monitor:
-    Keeps the terminal active, listening and self-healing if connection drops or rate-limits.
-    """
+    """Continuous background listener & auto-healing loop."""
     print("╭" + "─" * 58 + "╮")
     print("│  [●] المراقبة النشطة قيد العمل (Active Sentinel Mode)     │")
+    print("│  - النافذة ستظل مفتوحة أمامك دائماً لمراقبة النفق        │")
     print("│  - إذا انقطع النفق أو انتهى الليمت سيتم التجديد تلقائياً  │")
-    print("│  - للإيقاف وإلغاء النفق: أغلق النافذة أو اضغط Ctrl + C    │")
+    print("│  - لإلغاء النفق والخروج: أغلق هذه النافذة أو اضغط Ctrl+C │")
     print("╰" + "─" * 58 + "╯")
 
     fail_count = 0
@@ -376,7 +376,7 @@ def active_sentinel_loop(warp_cli, current_ip):
                     print_success_card(current_ip)
                 continue
 
-            # Check OpenCode API status
+            # Check OpenCode API
             ok, msg = verify_opencode_deepseek()
             if not ok and "429" in msg:
                 fail_count += 1
@@ -405,16 +405,18 @@ def main():
         print("[!] جاري طلب صلاحيات المسؤول (Administrator)...")
         if not request_admin_elevation():
             print("[X] تعذر الحصول على صلاحيات المسؤول.")
+            input("\nاضغط ENTER للخروج...")
             return 1
         return 0
 
-    # 2. Cleanup old instances & disable Cloudflare tray / auto-start
+    # 2. Cleanup old instances safely & disable Cloudflare tray
     cleanup_old_instances()
     disable_cloudflare_startup_and_tray()
 
     warp_cli = find_warp_cli()
     if not warp_cli:
         print("[X] لم يتم العثور على warp-cli.exe. تأكد من تثبيت Cloudflare WARP.")
+        input("\nاضغط ENTER للخروج...")
         return 2
 
     _G_WARP_CLI = warp_cli
@@ -431,7 +433,7 @@ def main():
     if initial_ip:
         print(f"  [*] عنوان IP الحالي قبل التغيير: {initial_ip}\n")
 
-    # 3. Execute renewal
+    # 3. Execute initial renewal
     success, assigned_ip = run_renewal_routine(warp_cli)
 
     if success:
@@ -439,7 +441,7 @@ def main():
     else:
         print(f"\n  [!] النفق متصل بـ IP: {assigned_ip or 'Active'} | جاري الدخول لوضع الحراسة...")
 
-    # 4. Continuous listening / auto-healing sentinel
+    # 4. Stay active in Sentinel Loop (window never disappears)
     active_sentinel_loop(warp_cli, assigned_ip)
     return 0
 
@@ -451,4 +453,6 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as ex:
         log(f"Fatal error: {ex}")
+        print(f"\n[X] حدث خطأ غير متوقع: {ex}")
+        input("\nاضغط ENTER للخروج...")
         sys.exit(1)
