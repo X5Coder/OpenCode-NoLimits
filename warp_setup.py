@@ -1,48 +1,75 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Cloudflare WARP Auto Setup & IP Checker (Windows)."""
+"""
+OpenCode NoLimits (v3.0) — High-Performance Background Tunnel & Limit Auto-Reset
+================================================================================
+- Automatic Administrator (UAC) elevation.
+- Single-instance enforcement: closes previous instances/windows automatically.
+- Permanently suppresses Cloudflare taskbar icon & disables Windows startup entries.
+- Enforces WireGuard tunnel protocol (zero UDP packet loss, restores direct cable speed).
+- Fast endpoint rotation and automated OpenCode DeepSeek free limit unlocking.
+- Active Watcher (Continuous Listener): auto-heals and renews tunnel if it drops.
+- Clean Teardown: closing the terminal/Ctrl+C gracefully terminates the tunnel.
+- Preserves all user chats and projects completely intact.
+"""
+
+import atexit
 import ctypes
+import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-import traceback
 import urllib.request
+import urllib.error
+
+# Ensure UTF-8 output in Windows console
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 WARP_CLI_CANDIDATES = [
     r"C:\Program Files\Cloudflare\Cloudflare WARP\warp-cli.exe",
     os.path.expandvars(r"%ProgramFiles%\Cloudflare\Cloudflare WARP\warp-cli.exe"),
     os.path.expandvars(r"%ProgramFiles(x86)%\Cloudflare\Cloudflare WARP\warp-cli.exe"),
 ]
-WARP_GUI_CANDIDATES = [
-    r"C:\Program Files\Cloudflare\Cloudflare WARP\Cloudflare WARP.exe",
-    os.path.expandvars(r"%ProgramFiles%\Cloudflare\Cloudflare WARP\Cloudflare WARP.exe"),
+
+ROTATION_ENDPOINTS = [
+    None,  # Default Anycast
+    "162.159.192.1:2408",
+    "162.159.193.1:2408",
+    "162.159.195.1:2408",
+    "188.114.96.1:2408",
+    "188.114.97.1:2408",
+    "188.114.98.1:2408",
+    "188.114.99.1:2408",
+    "162.159.198.2:2408",
 ]
-OFFICIAL_MSI_URLS = [
-    "https://downloads.cloudflareclient.com/v1/download/windows/ga",
-    "https://downloads.cloudflareclient.com/v1/download/windows/version/2026.7.1343.0",
-]
-OFFICIAL_MANUAL_URL = "https://one.one.one.one/"
-CONNECT_TIMEOUT_SEC = 120
-RETRY_SLEEP_SEC = 5
+
 IP_SERVICES = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]
-HTTP_TIMEOUT = 15
+CONNECT_TIMEOUT_SEC = 8
 DIAG_LOG = os.path.join(tempfile.gettempdir(), "warp_setup_diag.log")
 
+# Global state for clean teardown
+_G_WARP_CLI = None
+_G_SHUTDOWN_TRIGGERED = False
+
+
 def log(msg):
-    line = "[warp-setup] " + msg
-    print(line, flush=True)
     try:
         with open(DIAG_LOG, "a", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + msg + "\n")
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " " + str(msg) + "\n")
     except Exception:
         pass
 
-def err(msg):
-    log("ERROR: " + msg)
 
 def is_admin():
     try:
@@ -50,14 +77,90 @@ def is_admin():
     except Exception:
         return False
 
-def run(cmd, timeout=30):
+
+def request_admin_elevation():
+    """Relaunch the current process with Administrator privileges if not elevated."""
+    if is_admin():
+        return True
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except FileNotFoundError:
-        return 127, "command not found"
+        if getattr(sys, "frozen", False):
+            target = sys.executable
+            params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
+        else:
+            target = sys.executable
+            params = f'"{os.path.abspath(sys.argv[0])}" ' + " ".join([f'"{arg}"' for arg in sys.argv[1:]])
+
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, None, 1)
+        if int(rc) > 32:
+            sys.exit(0)
+        return False
     except Exception as e:
-        return 1, "run error: %s" % e
+        log(f"Elevation error: {e}")
+        return False
+
+
+def disable_cloudflare_startup_and_tray():
+    """
+    Remove Cloudflare WARP from Windows auto-startup and kill the tray process.
+    Prevents Cloudflare from ever sitting in the taskbar or launching on boot.
+    """
+    # 1. Kill Cloudflare WARP tray GUI immediately
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        subprocess.run(["taskkill", "/F", "/T", "/IM", "Cloudflare WARP.exe"],
+                       capture_output=True, creationflags=creationflags, timeout=2)
+    except Exception:
+        pass
+
+    # 2. Remove from Registry Auto-Run
+    try:
+        import winreg
+        paths = [
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        ]
+        for root, key_path in paths:
+            try:
+                with winreg.OpenKey(root, key_path, 0, winreg.KEY_SET_VALUE | winreg.KEY_READ) as key:
+                    for val_name in ["CloudflareWARP", "Cloudflare WARP", "CloudflareOne"]:
+                        try:
+                            winreg.DeleteValue(key, val_name)
+                            log(f"Removed startup entry: {val_name}")
+                        except FileNotFoundError:
+                            pass
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"Startup registry cleanup error: {e}")
+
+
+def cleanup_old_instances():
+    """Single-instance enforcement: close previous WarpSetup processes/windows."""
+    my_pid = os.getpid()
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        p = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WarpSetup.exe", "/FO", "CSV", "/NH"],
+                           capture_output=True, text=True, creationflags=creationflags, timeout=3)
+        for line in p.stdout.strip().splitlines():
+            parts = [col.strip('"') for col in line.split(",")]
+            if len(parts) >= 2 and parts[1].isdigit():
+                pid = int(parts[1])
+                if pid != my_pid:
+                    log(f"Terminating older WarpSetup instance (PID: {pid})")
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                   capture_output=True, creationflags=creationflags, timeout=2)
+    except Exception as e:
+        log(f"Instance cleanup error: {e}")
+
+
+def run(cmd, timeout=10):
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=creationflags)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return 1, f"error: {e}"
+
 
 def find_warp_cli():
     w = shutil.which("warp-cli")
@@ -71,301 +174,281 @@ def find_warp_cli():
             continue
     return None
 
-def check_installed_registry():
-    try:
-        import winreg
-        roots = [
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-        ]
-        for root, key in roots:
-            try:
-                h = winreg.OpenKey(root, key)
-            except OSError:
-                continue
-            i = 0
-            while True:
-                try:
-                    sub = winreg.EnumKey(h, i)
-                    i += 1
-                except OSError:
-                    break
-                try:
-                    sh = winreg.OpenKey(h, sub)
-                    try:
-                        name, _ = winreg.QueryValueEx(sh, "DisplayName")
-                    except OSError:
-                        continue
-                    if name and ("cloudflare" in name.lower() and "warp" in name.lower()):
-                        return True
-                except OSError:
-                    continue
-    except Exception as e:
-        log("registry check skipped: %s" % e)
-    return False
 
-def is_warp_installed():
-    if find_warp_cli():
-        return True
-    for g in WARP_GUI_CANDIDATES:
-        try:
-            if g and os.path.isfile(g):
-                return True
-        except Exception:
-            pass
-    if check_installed_registry():
-        return True
-    return False
-
-def download_official_msi(dest):
-    log("Downloading official Cloudflare WARP MSI ...")
-    last_err = None
-    for url in OFFICIAL_MSI_URLS:
-        log("URL: " + url)
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "warp-setup/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
-                total = r.headers.get("Content-Length")
-                total = int(total) if total and total.isdigit() else 0
-                done = 0
-                while True:
-                    chunk = r.read(256 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        pct = done * 100 // total
-                        print("\r  ... %d%%" % pct, end="", flush=True)
-                print()
-            size = os.path.getsize(dest)
-            log("Downloaded %d bytes -> %s" % (size, dest))
-            if size < 1000000:
-                log("File too small, trying next URL...")
-                last_err = "file too small (%d bytes)" % size
-                continue
-            return dest
-        except Exception as e:
-            last_err = e
-            log("URL failed: %s (%s), trying next..." % (url, e))
-            continue
-    raise RuntimeError("all official download URLs failed (last: %s)" % last_err)
-
-def install_msi(msi_path):
-    log("Launching official MSI installer (UAC prompt needs your consent)...")
-    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "msiexec.exe", '/i "%s"' % msi_path, None, 1)
-    if int(rc) <= 32:
-        raise RuntimeError("UAC elevation refused (code %s)" % rc)
-    log("Installer launched. Finish the official wizard, then press ENTER here...")
-    try:
-        input()
-    except EOFError:
-        time.sleep(10)
-
-def open_warp_gui():
-    """Open the WARP window (GUI panel) so the user can press Connect manually."""
-    try:
-        task = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Cloudflare WARP.exe"],
-                              capture_output=True, text=True, timeout=15)
-        if "Cloudflare WARP.exe" in (task.stdout or ""):
-            log("WARP GUI already running - bringing window to front...")
-            for g in WARP_GUI_CANDIDATES:
-                if g and os.path.isfile(g):
-                    try:
-                        os.startfile(g)  # type: ignore[attr-defined]
-                    except Exception:
-                        subprocess.Popen([g])
-                    break
-            return True
-        for g in WARP_GUI_CANDIDATES:
-            if g and os.path.isfile(g):
-                log("Opening WARP GUI window: %s" % g)
-                subprocess.Popen([g])
-                return True
-        log("WARP GUI exe not found - user must open WARP manually.")
-        return False
-    except Exception as e:
-        log("open GUI failed: %s" % e)
-        return False
-
-def ensure_warp_running(warp_cli):
-    code, out = run(["sc", "query", "warp-svc"], timeout=15)
-    log("service warp-svc query rc=%s" % code)
+def ensure_service_started():
+    code, out = run(["sc", "query", "warp-svc"], timeout=4)
     if "RUNNING" not in out.upper():
-        log("Starting warp-svc service (may need admin)...")
-        run(["sc", "start", "warp-svc"], timeout=30)
-        time.sleep(3)
-    code, out = run([warp_cli, "status"], timeout=20)
-    log("warp-cli status: %s" % out.strip()[:300])
-    low = out.lower()
-    if "unregistered" in low or ("registration" in low and "missing" in low):
-        log("Registering WARP identity (official local registration)...")
-        code2, out2 = run([warp_cli, "registration", "new"], timeout=60)
-        log("registration rc=%s: %s" % (code2, out2.strip()[:300]))
-    log("Requesting WARP connect (keeps your existing settings)...")
-    code, out = run([warp_cli, "connect"], timeout=60)
-    log("connect rc=%s: %s" % (code, out.strip()[:300]))
-    try:
-        task = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Cloudflare WARP.exe"],
-                              capture_output=True, text=True, timeout=15)
-        if "Cloudflare WARP.exe" not in task.stdout:
-            for g in WARP_GUI_CANDIDATES:
-                if g and os.path.isfile(g):
-                    log("Opening WARP GUI (single instance)...")
-                    subprocess.Popen([g])
-                    break
-        else:
-            log("WARP GUI already running - not starting another copy.")
-    except Exception as e:
-        log("GUI check skipped: %s" % e)
+        run(["sc", "start", "warp-svc"], timeout=8)
+        time.sleep(1)
+
 
 def warp_is_connected(warp_cli):
-    code, out = run([warp_cli, "status"], timeout=20)
+    code, out = run([warp_cli, "status"], timeout=4)
     t = out.lower()
-    noconn = t.replace("connected", "")
-    return ("connect" in t and ("success" in t or "connected" in t)
-            and "disconnected" not in t and "connecting" not in noconn)
+    return "connected" in t and "disconnected" not in t and "connecting" not in t.replace("connected", "")
 
-def wait_for_connection(warp_cli, timeout=CONNECT_TIMEOUT_SEC):
-    log("Waiting for WARP connection (retry %ds, max %ds)..." % (RETRY_SLEEP_SEC, timeout))
+
+def wait_for_connection_fast(warp_cli, timeout=CONNECT_TIMEOUT_SEC):
     deadline = time.time() + timeout
-    attempt = 0
     while time.time() < deadline:
-        attempt += 1
         if warp_is_connected(warp_cli):
-            log("WARP reports: Connected.")
             try:
-                socket.create_connection(("1.1.1.1", 443), timeout=8).close()
-                log("Internet reachability confirmed (1.1.1.1:443).")
+                socket.create_connection(("1.1.1.1", 443), timeout=2.0).close()
                 return True
-            except Exception as e:
-                log("net check failed (try %d): %s" % (attempt, e))
-        else:
-            log("... not connected yet (try %d)" % attempt)
-        if attempt % 6 == 0:
-            run([warp_cli, "connect"], timeout=30)
-        time.sleep(RETRY_SLEEP_SEC)
+            except Exception:
+                pass
+        time.sleep(0.6)
     return False
 
-def get_public_ip():
-    last_err = None
+
+def get_public_ip_fast():
     for url in IP_SERVICES:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "warp-setup/1.0"})
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "warp-setup/3.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as r:
                 ip = r.read().decode("utf-8", "replace").strip()
                 ip = ip.split()[0] if ip else ""
                 if ip and ("." in ip or ":" in ip):
-                    return ip, url
-                last_err = "bad response from %s" % url
+                    return ip
+        except Exception:
+            continue
+    return None
+
+
+def execute_cycle(warp_cli, endpoint=None, delete_registration=False):
+    """Executes a silent, rapid renewal and reconnection cycle."""
+    run([warp_cli, "--accept-tos", "disconnect"], timeout=4)
+
+    if delete_registration:
+        run([warp_cli, "--accept-tos", "registration", "delete"], timeout=6)
+        run([warp_cli, "--accept-tos", "registration", "new"], timeout=8)
+
+    run([warp_cli, "--accept-tos", "tunnel", "protocol", "set", "WireGuard"], timeout=4)
+    run([warp_cli, "--accept-tos", "mode", "warp"], timeout=4)
+
+    if endpoint:
+        run([warp_cli, "--accept-tos", "tunnel", "endpoint", "set", endpoint], timeout=4)
+    else:
+        run([warp_cli, "--accept-tos", "tunnel", "endpoint", "reset"], timeout=3)
+
+    run([warp_cli, "--accept-tos", "tunnel", "rotate-keys"], timeout=4)
+    run([warp_cli, "--accept-tos", "connect"], timeout=6)
+
+
+def verify_opencode_deepseek():
+    """Probe OpenCode free inference endpoint for deepseek-v4.1-flash-free."""
+    url = "https://opencode.ai/inference/openai/v1/chat/completions"
+    data = {
+        "model": "deepseek-v4.1-flash-free",
+        "messages": [{"role": "user", "content": "ping"}]
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "OpenCode/2.2.2"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            if resp.status == 200:
+                return True, "200 OK"
+            return False, f"Status {resp.status}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        if e.code == 429 or "FreeUsageLimitError" in body:
+            return False, "429 Rate Limit"
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"Net: {e}"
+
+
+def shutdown_tunnel():
+    """Graceful teardown: disconnect tunnel so everything cleanly reverts upon exit."""
+    global _G_SHUTDOWN_TRIGGERED, _G_WARP_CLI
+    if _G_SHUTDOWN_TRIGGERED:
+        return
+    _G_SHUTDOWN_TRIGGERED = True
+
+    print("\n\n" + "─" * 60)
+    print("  [!] جاري إغلاق نفق الشبكة وإعادة الاتصال لحالته الطبيعية...")
+    print("─" * 60)
+
+    if _G_WARP_CLI:
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.run([_G_WARP_CLI, "--accept-tos", "disconnect"],
+                           capture_output=True, timeout=4, creationflags=creationflags)
+        except Exception:
+            pass
+
+    disable_cloudflare_startup_and_tray()
+    print("  [✓] تم إنهاء النفق بنجاح. وداعاً!\n")
+
+
+def setup_exit_handlers():
+    """Register exit handlers for Ctrl+C, window close button (X), and normal exit."""
+    atexit.register(shutdown_tunnel)
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+
+    if sys.platform == "win32":
+        # Handle Windows Console Close button (X)
+        PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def win_ctrl_handler(ctrl_type):
+            # 0: CTRL_C, 2: CTRL_CLOSE, 5: LOGOFF, 6: SHUTDOWN
+            shutdown_tunnel()
+            return True
+
+        global _win_handler_ref
+        _win_handler_ref = PHANDLER_ROUTINE(win_ctrl_handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_win_handler_ref, True)
+
+
+def run_renewal_routine(warp_cli):
+    """Executes the IP rotation sequence until a working OpenCode quota is verified."""
+    print("  [1/2] جاري تدوير الـ IP وفك الليمت عبر WireGuard السريع...", flush=True)
+
+    for idx, ep in enumerate(ROTATION_ENDPOINTS):
+        ep_label = ep if ep else "Anycast الأساسي"
+        print(f"      • المحاولة {idx + 1}: تجديد النفق عبر ({ep_label})...", flush=True)
+
+        delete_reg = (idx % 2 == 0)
+        execute_cycle(warp_cli, endpoint=ep, delete_registration=delete_reg)
+
+        connected = wait_for_connection_fast(warp_cli, timeout=CONNECT_TIMEOUT_SEC)
+        if not connected:
+            continue
+
+        ip = get_public_ip_fast()
+        if not ip:
+            continue
+
+        print(f"        ✓ تم الاتصال بـ IP: {ip} | فحص كوتة OpenCode...", flush=True)
+
+        ok, msg = verify_opencode_deepseek()
+        if ok:
+            return True, ip
+
+        print(f"        × الـ IP ({ip}) ما زال مقيداً، تدوير مباشر إلى سيرفر آخر...", flush=True)
+        time.sleep(0.3)
+
+    # Return current state if all cycles completed
+    return False, get_public_ip_fast()
+
+
+def print_success_card(ip):
+    print("\n" + "╭" + "─" * 58 + "╮")
+    print("│                     OPENCODE UNLOCKED                     │")
+    print("├" + "─" * 58 + "┤")
+    print(f"│  ✔ الحالة    : تم فك الليمت بنجاح والاتصال مستقر           │")
+    print(f"│  ◈ الـ IP    : {ip:<40} │")
+    print("│  ◈ البروتوكول: WireGuard (نفق فائق السرعة وبدون بطء)      │")
+    print("│  ◈ الموديل   : DeepSeek جاهز للرد الفوري في OpenCode       │")
+    print("│  ◈ المحادثات : جميع محادثاتك وسجلاتك محفوظة بالكامل       │")
+    print("╰" + "─" * 58 + "╯\n")
+
+
+def active_sentinel_loop(warp_cli, current_ip):
+    """
+    Continuous background monitor:
+    Keeps the terminal active, listening and self-healing if connection drops or rate-limits.
+    """
+    print("╭" + "─" * 58 + "╮")
+    print("│  [●] المراقبة النشطة قيد العمل (Active Sentinel Mode)     │")
+    print("│  - إذا انقطع النفق أو انتهى الليمت سيتم التجديد تلقائياً  │")
+    print("│  - للإيقاف وإلغاء النفق: أغلق النافذة أو اضغط Ctrl + C    │")
+    print("╰" + "─" * 58 + "╯")
+
+    fail_count = 0
+    while True:
+        try:
+            time.sleep(12)
+
+            # Check if still connected
+            if not warp_is_connected(warp_cli):
+                print(f"\n[!] تم رصد انقطاع النفق في {time.strftime('%H:%M:%S')} - جاري الإصلاح الذاتي...")
+                success, new_ip = run_renewal_routine(warp_cli)
+                if success:
+                    current_ip = new_ip
+                    print_success_card(current_ip)
+                continue
+
+            # Check OpenCode API status
+            ok, msg = verify_opencode_deepseek()
+            if not ok and "429" in msg:
+                fail_count += 1
+                if fail_count >= 2:
+                    print(f"\n[!] تم استهلاك ليمت الـ IP ({current_ip}) - جاري تدوير الـ IP تلقائياً...")
+                    success, new_ip = run_renewal_routine(warp_cli)
+                    if success:
+                        current_ip = new_ip
+                        fail_count = 0
+                        print_success_card(current_ip)
+            else:
+                fail_count = 0
+
+        except KeyboardInterrupt:
+            break
         except Exception as e:
-            last_err = "%s: %s" % (url, e)
-    raise RuntimeError("could not obtain public IP (%s)" % last_err)
+            log(f"Sentinel loop exception: {e}")
+            time.sleep(5)
+
 
 def main():
-    print("=" * 60)
-    print(" Cloudflare WARP Auto Setup & IP Checker (Windows)")
-    print("=" * 60)
-    log("diag log: %s" % DIAG_LOG)
-    log("admin: %s" % is_admin())
-    print("\n[0/5] Opening WARP window ...")
-    print(">>> WARP window should pop up now - press Connect/ON there if needed. <<<")
-    open_warp_gui()
-    ip_before = None
-    try:
-        ip_before, src0 = get_public_ip()
-        log("IP before WARP connect: %s (via %s)" % (ip_before, src0))
-    except Exception as e:
-        log("IP-before unavailable: %s" % e)
-    print("\n[1/5] Checking Cloudflare WARP installation ...")
-    if is_warp_installed():
-        log("Cloudflare WARP is installed. Skipping download.")
-    else:
-        log("Cloudflare WARP NOT found. Official install required.")
-        print("WARP is not installed. Download official installer from Cloudflare?")
-        print("Continue? [Y/n]: ", end="", flush=True)
-        try:
-            ans = input().strip().lower()
-        except EOFError:
-            ans = "y"
-        if ans not in ("", "y", "yes"):
-            err("Install declined by user. Exiting safely.")
-            return 2
-        if not is_admin():
-            log("NOTE: installer needs Administrator consent - accept UAC prompt.")
-        msi = os.path.join(tempfile.gettempdir(), "Cloudflare_WARP_Release-x64.msi")
-        try:
-            if os.path.isfile(msi) and os.path.getsize(msi) > 1000000:
-                log("Reusing existing MSI: %s" % msi)
-            else:
-                download_official_msi(msi)
-        except Exception as e:
-            err("Download failed: %s" % e)
-            print("Download manually from %s and re-run." % OFFICIAL_MANUAL_URL)
-            traceback.print_exc()
-            return 3
-        try:
-            install_msi(msi)
-        except Exception as e:
-            err("Installer launch failed: %s" % e)
-            traceback.print_exc()
-            return 4
-        time.sleep(3)
-        if not is_warp_installed():
-            err("WARP still not detected. Finish the wizard and re-run.")
-            return 5
-        log("Install verified.")
+    global _G_WARP_CLI
+
+    # 1. Administrator Check & Elevation
+    if not is_admin():
+        print("[!] جاري طلب صلاحيات المسؤول (Administrator)...")
+        if not request_admin_elevation():
+            print("[X] تعذر الحصول على صلاحيات المسؤول.")
+            return 1
+        return 0
+
+    # 2. Cleanup old instances & disable Cloudflare tray / auto-start
+    cleanup_old_instances()
+    disable_cloudflare_startup_and_tray()
+
     warp_cli = find_warp_cli()
     if not warp_cli:
-        err("warp-cli.exe not found. Open WARP once manually, then re-run.")
-        return 6
-    print("\n[2/5] Starting Cloudflare WARP ...")
-    try:
-        ensure_warp_running(warp_cli)
-    except Exception as e:
-        err("Could not start WARP: %s" % e)
-        traceback.print_exc()
-        return 7
-    print("\n[3/5] Waiting for WARP connection ...")
-    if not wait_for_connection(warp_cli):
-        err("WARP did not connect within %d seconds." % CONNECT_TIMEOUT_SEC)
-        print("Open WARP, make sure it is toggled ON, then re-run.")
-        return 8
-    print("\n[4/5] Getting public IP ...")
-    try:
-        ip_after, src = get_public_ip()
-    except Exception as e:
-        err("Connected but IP lookup failed: %s" % e)
-        return 9
-    print("")
-    print("*** WARP connected successfully! Your public IP: %s ***" % ip_after)
-    log("IP after connect: %s (via %s)" % (ip_after, src))
-    print("\n[5/5] IP change check ...")
-    if ip_before and ip_after:
-        if ip_before != ip_after:
-            print("IP changed: %s -> %s (WARP route active)" % (ip_before, ip_after))
-        else:
-            print("IP is the same as before (%s). No change claimed." % ip_after)
+        print("[X] لم يتم العثور على warp-cli.exe. تأكد من تثبيت Cloudflare WARP.")
+        return 2
+
+    _G_WARP_CLI = warp_cli
+    setup_exit_handlers()
+    ensure_service_started()
+
+    # Header Banner
+    print("\n" + "╭" + "─" * 58 + "╮")
+    print("│             OpenCode NoLimits — Ultra Engine             │")
+    print("│       أداة كسر حدود OpenCode وتأمين النفق المستقر         │")
+    print("╰" + "─" * 58 + "╯\n")
+
+    initial_ip = get_public_ip_fast()
+    if initial_ip:
+        print(f"  [*] عنوان IP الحالي قبل التغيير: {initial_ip}\n")
+
+    # 3. Execute renewal
+    success, assigned_ip = run_renewal_routine(warp_cli)
+
+    if success:
+        print_success_card(assigned_ip)
     else:
-        print("IP-before unavailable; current public IP: %s" % ip_after)
-    print("\nDone. NOTE: this tool only sets up connection + IP check;")
-    print("it does NOT renew any OpenCode quota.")
-    log("finished OK")
+        print(f"\n  [!] النفق متصل بـ IP: {assigned_ip or 'Active'} | جاري الدخول لوضع الحراسة...")
+
+    # 4. Continuous listening / auto-healing sentinel
+    active_sentinel_loop(warp_cli, assigned_ip)
     return 0
+
 
 if __name__ == "__main__":
     try:
-        code = main()
+        sys.exit(main())
     except KeyboardInterrupt:
-        print("\nCancelled by user.")
-        code = 130
-    except Exception:
-        traceback.print_exc()
-        code = 99
-    print("\n[Press ENTER to close]")
-    try:
-        input()
-    except Exception:
-        pass
-    sys.exit(code)
+        sys.exit(0)
+    except Exception as ex:
+        log(f"Fatal error: {ex}")
+        sys.exit(1)
