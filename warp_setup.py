@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenCode NoLimits (v5.0) - One-Click Activation
-===============================================
-What happens when you double-click the icon:
+OpenCode NoLimits (v6.0) - Live Console, WARP + warp-plus Fallback
+==================================================================
+Design rules (as requested):
 
-  1. UAC prompt (once) -> one terminal window opens automatically.
-  2. THREE worker threads start together:
-        [1] SCOUT   -> probes every WARP endpoint in parallel (3 probes at a time)
-        [2] TUNNEL  -> owns warp-cli, connects to the fastest candidate first
-        [3] VERIFY  -> fetches the new public IP + checks the free-model quota
-  3. The FIRST candidate that passes verification wins. Losing attempts are
-     abandoned immediately (no zombie workers, no extra windows).
-  4. The terminal prints "ACTIVATION DONE", waits ~2 seconds and closes itself.
-  5. Only the winning tunnel is left running (it lives inside the Windows
-     service warp-svc, so closing the window does NOT kill it).
-
-Why the old "3 threads = 3 tunnels" idea could never work:
-    warp-cli is a thin client of ONE Windows service (warp-svc) that owns ONE
-    tunnel. Three threads calling `warp-cli connect` with different endpoints
-    fight over the same single tunnel: each one disconnects the previous one.
-    Real parallelism is implemented where it is actually possible:
-    endpoint prescreening, IP lookup and quota verification all run
-    concurrently, while tunnel mutation stays serialized.
+  * NOTHING closes by itself.  The window stays open and shows every step.
+  * Cloudflare WARP runs as ONE worker thread that keeps retrying until the
+    quota is really reset. No parallel tunnel attempts (warp-cli is a client
+    of a single Windows service, parallel attempts would fight each other).
+  * If WARP fails 2 rounds in a row, warp-plus is downloaded (once, cached)
+    and tried as a fallback. If it works, its SOCKS5 proxy stays alive.
+  * Losing attempts are stopped immediately; the winner is the only thing
+    left running.
+  * Ctrl+C stops everything cleanly.
 
 Usage:
-    WarpSetup.exe              one-shot activation (default)
-    WarpSetup.exe --stop       disconnect the tunnel and restore normal internet
-    WarpSetup.exe --watch      keep the window open and auto-heal (legacy mode)
-    WarpSetup.exe --no-close   keep the window open after activation
+    WarpSetup.exe                 start and keep retrying (default)
+    WarpSetup.exe --stop          stop WARP + warp-plus and restore internet
+    WarpSetup.exe --no-fallback   never download/use warp-plus
+    WarpSetup.exe --probe-threads 1
+    WarpSetup.exe --no-elevate    run without UAC prompt (limited cleanup)
 """
 
 from __future__ import annotations
@@ -38,10 +30,10 @@ import atexit
 import ctypes
 import json
 import os
-import random
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -49,6 +41,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 # --------------------------------------------------------------------------- #
@@ -61,7 +54,9 @@ WARP_CLI_CANDIDATES = [
     os.path.expandvars(r"%ProgramFiles(x86)%\Cloudflare\Cloudflare WARP\warp-cli.exe"),
 ]
 
-# None = Cloudflare default Anycast (usually the most reliable, keep it first).
+WARP_SERVICE_NAMES = ["CloudflareWARP", "warp-svc"]
+
+# None = Cloudflare default Anycast (usually the most reliable).
 ROTATION_ENDPOINTS = [
     None,
     "162.159.192.1:2408",
@@ -75,12 +70,18 @@ ROTATION_ENDPOINTS = [
 ]
 
 IP_SERVICES = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]
+OPENCODE_API = "https://opencode.ai/inference/openai/v1/chat/completions"
+OPENCODE_MODEL = "deepseek-v4.1-flash-free"
 
-WORKERS = 3                 # prescreen threads ("3 threads" as requested)
-CONNECT_TIMEOUT_SEC = 6.0   # hard cap for one handshake
-PROBE_TIMEOUT_SEC = 1.2     # prescreen latency probe
-DEFAULT_BUDGET_SEC = 120    # keep retrying for this long before giving up
-MAX_ROUNDS = 2              # full passes over the endpoint list
+PROBE_TIMEOUT_SEC = 1.2
+CONNECT_TIMEOUT_SEC = 7.0
+VERIFY_TIMEOUT_SEC = 6.0
+
+# warp-plus fallback
+WARP_PLUS_ZIP_URL = ("https://github.com/bepass-org/warp-plus/releases/latest/download/"
+                     "warp-plus_windows-amd64.zip")
+WARP_PLUS_PORT = 8086
+WARP_PLUS_BOOT_TIMEOUT = 40.0
 
 TEMP_DIR = tempfile.gettempdir()
 DIAG_LOG = os.path.join(TEMP_DIR, "warp_setup_diag.log")
@@ -88,28 +89,38 @@ PID_LOCK_FILE = os.path.join(TEMP_DIR, "opencode_nolimits.pid")
 
 STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", TEMP_DIR), "OpenCodeNoLimits")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
+WARP_PLUS_DIR = os.path.join(STATE_DIR, "warp-plus")
+WARP_PLUS_EXE = os.path.join(WARP_PLUS_DIR, "warp-plus.exe")
+WARP_PLUS_CACHE = os.path.join(WARP_PLUS_DIR, "cache")
 
 SHELL_PROCESS_NAMES = {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe",
                        "conhost.exe", "wt.exe", "bash.exe", "wsl.exe"}
 
 # --------------------------------------------------------------------------- #
-# Global runtime state
+# Global state
 # --------------------------------------------------------------------------- #
 
 _G_WARP_CLI = None
-_G_ACTIVATED = False
-_G_SHUTDOWN_LOCK = threading.Lock()
-_G_SHUTDOWN_DONE = False
+_G_WARP_PLUS_PROC = None
+_G_KEEP_TUNNEL = False
+_G_EXIT_LOCK = threading.Lock()
+_G_EXIT_DONE = False
 _G_PRINT_LOCK = threading.Lock()
+_G_STOP = threading.Event()
+_G_REPAIRED = False
+_G_HINTED = False
 
 
 def say(message: str = "") -> None:
-    """Thread-safe console output."""
     with _G_PRINT_LOCK:
         try:
             print(message, flush=True)
         except Exception:
             pass
+
+
+def step(tag: str, message: str) -> None:
+    say("  [%s] %-8s %s" % (time.strftime("%H:%M:%S"), tag, message))
 
 
 def log(message: str) -> None:
@@ -144,54 +155,23 @@ def is_admin() -> bool:
         return False
 
 
-def request_admin_elevation() -> bool:
+def request_admin_elevation(argv) -> bool:
     if is_admin():
         return True
     try:
         if getattr(sys, "frozen", False):
-            target = sys.executable
-            params = " ".join('"%s"' % arg for arg in sys.argv[1:])
+            target, params = sys.executable, " ".join('"%s"' % a for a in argv)
         else:
             target = sys.executable
-            params = '"%s" ' % os.path.abspath(sys.argv[0]) + \
-                     " ".join('"%s"' % arg for arg in sys.argv[1:])
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, None, 1)
-        return int(rc) > 32
+            params = '"%s" ' % os.path.abspath(sys.argv[0]) + " ".join('"%s"' % a for a in argv)
+        return int(ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, None, 1)) > 32
     except Exception as exc:
         log("Elevation error: %s" % exc)
         return False
 
 
-def process_image_name(pid: int) -> str:
-    try:
-        code, out = run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"], timeout=3)
-        line = out.strip().splitlines()[0]
-        return line.split(",")[0].strip('"').lower()
-    except Exception:
-        return ""
-
-
-def console_is_owned_by_us() -> bool:
-    """True when this process created its own console (double-click launch)."""
-    if sys.platform != "win32":
-        return False
-    try:
-        buf = (ctypes.c_uint * 64)()
-        count = ctypes.windll.kernel32.GetConsoleProcessList(buf, 64)
-        if count <= 0:
-            return False
-        pids = [buf[i] for i in range(count)]
-        others = [pid for pid in pids if pid != os.getpid()]
-        for pid in others:
-            if process_image_name(pid) in SHELL_PROCESS_NAMES:
-                return False          # launched from an existing terminal: keep it
-        return count <= 3             # our process (or PyInstaller parent+child) only
-    except Exception:
-        return False
-
-
 # --------------------------------------------------------------------------- #
-# Cloudflare WARP primitives
+# WARP primitives
 # --------------------------------------------------------------------------- #
 
 def find_warp_cli():
@@ -207,31 +187,48 @@ def find_warp_cli():
     return None
 
 
-WARP_SERVICE_NAMES = ["CloudflareWARP", "warp-svc", "WarpSvcRPC"]
-
-
 def ensure_service_started() -> None:
-    """The service is called CloudflareWARP on new builds and warp-svc on old ones."""
     for name in WARP_SERVICE_NAMES:
         code, out = run(["sc", "query", name], timeout=4)
         if code == 0 or "SERVICE_NAME" in out.upper():
             if "RUNNING" not in out.upper():
-                run(["sc", "start", name], timeout=8)
-                time.sleep(1.0)
+                step("SVC", "starting service %s ..." % name)
+                run(["sc", "start", name], timeout=10)
+                time.sleep(1.5)
             return
-    log("WARP service not found by name, continuing anyway")
+    step("SVC", "WARP service not found (Cloudflare WARP not installed?)")
+
+
+def repair_registration(warp_cli: str) -> str:
+    """Registration missing is usually a stuck daemon: restart the service once."""
+    step("WARP", "repair: registration missing -> restarting the WARP service ...")
+    for name in WARP_SERVICE_NAMES:
+        code, out = run(["sc", "query", name], timeout=4)
+        if code == 0 or "SERVICE_NAME" in out.upper():
+            run(["sc", "stop", name], timeout=20)
+            time.sleep(2.0)
+            run(["sc", "start", name], timeout=20)
+            time.sleep(3.0)
+            break
+    run([warp_cli, "--accept-tos", "registration", "new"], timeout=12)
+    status = warp_status_text(warp_cli)
+    step("WARP", "repair result: %s" % status[:110])
+    return status
+
+
+def warp_status_text(warp_cli: str) -> str:
+    code, out = run([warp_cli, "--accept-tos", "status"], timeout=5)
+    return out.strip().replace("\n", " | ")
 
 
 def warp_is_connected(warp_cli: str) -> bool:
-    code, out = run([warp_cli, "status"], timeout=4)
-    text = out.lower()
-    if "disconnected" in text or "connecting" in text or "no connection" in text:
+    text = warp_status_text(warp_cli).lower()
+    if "disconnected" in text or "connecting" in text or "unable" in text or "no connection" in text:
         return False
     return "connected" in text
 
 
 def wait_for_connection_fast(warp_cli: str, timeout: float = CONNECT_TIMEOUT_SEC) -> bool:
-    """Poll the tunnel + a real TCP handshake, exit as soon as it is usable."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if warp_is_connected(warp_cli):
@@ -244,11 +241,11 @@ def wait_for_connection_fast(warp_cli: str, timeout: float = CONNECT_TIMEOUT_SEC
     return False
 
 
-def get_public_ip_fast():
+def get_public_ip_fast(timeout: float = 3.0):
     for url in IP_SERVICES:
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "warp-setup/5.0"})
-            with urllib.request.urlopen(request, timeout=3.0) as response:
+            request = urllib.request.Request(url, headers={"User-Agent": "warp-setup/6.0"})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 ip = response.read().decode("utf-8", "replace").strip()
             ip = ip.split()[0] if ip else ""
             if ip and ("." in ip or ":" in ip):
@@ -259,12 +256,11 @@ def get_public_ip_fast():
 
 
 def execute_cycle(warp_cli: str, endpoint=None, delete_registration: bool = False) -> None:
-    """Apply one endpoint + optional new identity, then connect (serialized)."""
     run([warp_cli, "--accept-tos", "disconnect"], timeout=4)
 
     if delete_registration:
         run([warp_cli, "--accept-tos", "registration", "delete"], timeout=6)
-        run([warp_cli, "--accept-tos", "registration", "new"], timeout=8)
+        run([warp_cli, "--accept-tos", "registration", "new"], timeout=10)
 
     run([warp_cli, "--accept-tos", "tunnel", "protocol", "set", "WireGuard"], timeout=4)
     run([warp_cli, "--accept-tos", "mode", "warp"], timeout=4)
@@ -275,59 +271,73 @@ def execute_cycle(warp_cli: str, endpoint=None, delete_registration: bool = Fals
         run([warp_cli, "--accept-tos", "tunnel", "endpoint", "reset"], timeout=3)
 
     run([warp_cli, "--accept-tos", "tunnel", "rotate-keys"], timeout=4)
-    run([warp_cli, "--accept-tos", "connect"], timeout=6)
+    run([warp_cli, "--accept-tos", "connect"], timeout=8)
 
 
-def verify_opencode_deepseek():
-    """Probe the free model endpoint.
+def parse_verdict(status, body: str):
+    if status == 200:
+        return "ok", "200 OK"
+    lowered = (body or "").lower()
+    if status == 429 or "freeusagelimiterror" in lowered or "usage limit" in lowered:
+        return "limited", "429 rate limit"
+    if status in (401, 403):
+        return "unknown", "HTTP %s (endpoint reachable)" % status
+    return "error", "HTTP %s" % status
 
-    Returns (verdict, message) where verdict is:
-        ok      -> HTTP 200, the model answered
-        limited -> 429 / FreeUsageLimitError, this IP is out of quota
-        unknown -> reachable but not verifiable without credentials
-        error   -> the request never reached the API (bad tunnel)
-    """
-    url = "https://opencode.ai/inference/openai/v1/chat/completions"
-    payload = {
-        "model": "deepseek-v4.1-flash-free",
+
+def verify_opencode_direct():
+    payload = json.dumps({
+        "model": OPENCODE_MODEL,
         "messages": [{"role": "user", "content": "ping"}],
-    }
+    }).encode("utf-8")
     request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
+        OPENCODE_API, data=payload,
         headers={"Content-Type": "application/json", "User-Agent": "OpenCode/2.2.2"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=5.0) as response:
-            return ("ok", "200 OK") if response.status == 200 else ("unknown", "status %s" % response.status)
+        with urllib.request.urlopen(request, timeout=VERIFY_TIMEOUT_SEC) as response:
+            body = response.read().decode("utf-8", "ignore")
+            return parse_verdict(response.status, body)
     except urllib.error.HTTPError as exc:
-        body = ""
         try:
             body = exc.read().decode("utf-8", "ignore")
         except Exception:
-            pass
-        if exc.code == 429 or "FreeUsageLimitError" in body or "usage limit" in body.lower():
-            return "limited", "429 rate limit"
-        if exc.code in (401, 403):
-            return "unknown", "HTTP %s (endpoint reachable)" % exc.code
-        return "error", "HTTP %s" % exc.code
+            body = ""
+        return parse_verdict(exc.code, body)
     except Exception as exc:
         return "error", "network: %s" % exc
 
 
-def disable_cloudflare_startup_and_tray() -> None:
-    """Silence the tray app and stop Cloudflare from coming back on boot."""
+def verify_ip_and_quota(ip_getter=None):
+    """IP lookup and quota probe run at the same time (two threads, read-only)."""
+    ip_getter = ip_getter or get_public_ip_fast
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ip_future = pool.submit(ip_getter)
+        quota_future = pool.submit(verify_opencode_direct)
+        try:
+            ip = ip_future.result(timeout=10)
+        except Exception:
+            ip = None
+        try:
+            verdict, message = quota_future.result(timeout=10)
+        except Exception:
+            verdict, message = "error", "timeout"
+    return ip, verdict, message
+
+
+def disable_cloudflare_tray() -> None:
     try:
         subprocess.run(["taskkill", "/F", "/T", "/IM", "Cloudflare WARP.exe"],
                        capture_output=True, creationflags=creation_flags(), timeout=2)
     except Exception:
         pass
 
+
+def remove_cloudflare_autostart() -> None:
     try:
         import winreg
     except Exception:
         return
-
     locations = [
         (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run"),
         (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
@@ -338,7 +348,6 @@ def disable_cloudflare_startup_and_tray() -> None:
                 for value_name in ("CloudflareWARP", "Cloudflare WARP", "CloudflareOne"):
                     try:
                         winreg.DeleteValue(key, value_name)
-                        log("Removed auto-start entry: %s" % value_name)
                     except FileNotFoundError:
                         pass
         except Exception:
@@ -346,7 +355,39 @@ def disable_cloudflare_startup_and_tray() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# State cache (so the 2nd click is nearly instant)
+# Endpoint prescreening (read-only latency probe)
+# --------------------------------------------------------------------------- #
+
+def probe_endpoint(endpoint, timeout: float = PROBE_TIMEOUT_SEC):
+    host = endpoint.split(":")[0] if endpoint else "162.159.192.1"
+    started = time.perf_counter()
+    try:
+        sock = socket.create_connection((host, 443), timeout=timeout)
+        sock.close()
+        return time.perf_counter() - started
+    except Exception:
+        return None
+
+
+def prescreen(candidates, workers: int = 3):
+    scores = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(probe_endpoint, endpoint): endpoint for endpoint in candidates}
+        for future in futures:
+            endpoint = futures[future]
+            try:
+                scores[endpoint] = future.result()
+            except Exception:
+                scores[endpoint] = None
+
+    alive = [e for e in candidates if scores.get(e) is not None]
+    alive.sort(key=lambda e: scores[e])
+    dead = [e for e in candidates if scores.get(e) is None]
+    return alive + dead, scores
+
+
+# --------------------------------------------------------------------------- #
+# State cache
 # --------------------------------------------------------------------------- #
 
 def load_state() -> dict:
@@ -358,12 +399,21 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(endpoint, ip) -> None:
+def save_state(endpoint=None, ip=None, method=None, proxy=None) -> None:
+    data = load_state()
+    if endpoint is not None:
+        data["good_endpoint"] = endpoint
+    if ip is not None:
+        data["ip"] = ip
+    if method is not None:
+        data["method"] = method
+    if proxy is not None:
+        data["proxy"] = proxy
+    data["at"] = time.time()
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(STATE_FILE, "w", encoding="utf-8") as fh:
-            json.dump({"good_endpoint": endpoint, "ip": ip, "at": time.time()},
-                      fh, indent=2)
+            json.dump(data, fh, indent=2)
     except Exception as exc:
         log("State save error: %s" % exc)
 
@@ -380,155 +430,312 @@ def build_candidates(state: dict):
 
 
 # --------------------------------------------------------------------------- #
-# Thread 1: SCOUT - parallel endpoint prescreening
+# SOCKS5 client (used to test / use warp-plus)
 # --------------------------------------------------------------------------- #
 
-def probe_endpoint(endpoint, timeout: float = PROBE_TIMEOUT_SEC):
-    """TCP RTT to the anycast edge. Returns seconds, or None if unreachable."""
-    host = endpoint.split(":")[0] if endpoint else "162.159.192.1"
-    started = time.perf_counter()
+class SocksError(Exception):
+    pass
+
+
+def socks5_connect(proxy_host: str, proxy_port: int, host: str, port: int, timeout: float = 10.0):
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     try:
-        sock = socket.create_connection((host, 443), timeout=timeout)
-        sock.close()
-        return time.perf_counter() - started
+        sock.sendall(b"\x05\x01\x00")
+        reply = sock.recv(2)
+        if len(reply) != 2 or reply[0] != 5 or reply[1] != 0:
+            raise SocksError("SOCKS5 handshake rejected")
+        request = b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode() + port.to_bytes(2, "big")
+        sock.sendall(request)
+        head = sock.recv(4)
+        if len(head) < 4 or head[1] != 0:
+            raise SocksError("SOCKS5 connect failed (code %s)" % (head[1] if len(head) > 1 else "?"))
+        atyp = head[3]
+        if atyp == 1:
+            sock.recv(4)
+        elif atyp == 3:
+            length = sock.recv(1)[0]
+            sock.recv(length)
+        elif atyp == 4:
+            sock.recv(16)
+        sock.recv(2)
+        return sock
     except Exception:
-        return None
-
-
-def prescreen(candidates, workers: int = WORKERS):
-    """Probe all candidates in parallel and return them fastest-first."""
-    scores = {}
-    say("  [1] Scout   : probing %d endpoints with %d parallel threads ..." % (len(candidates), workers))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(probe_endpoint, endpoint): endpoint for endpoint in candidates}
-        for future in futures:
-            endpoint = futures[future]
-            try:
-                scores[endpoint] = future.result()
-            except Exception:
-                scores[endpoint] = None
-
-    alive = [endpoint for endpoint in candidates if scores.get(endpoint) is not None]
-    alive.sort(key=lambda endpoint: scores[endpoint])
-    dead = [endpoint for endpoint in candidates if scores.get(endpoint) is None]
-
-    for endpoint in alive:
-        say("      + %-22s %4d ms" % (endpoint or "anycast (default)", int(scores[endpoint] * 1000)))
-    for endpoint in dead:
-        say("      - %-22s unreachable (queued last)" % (endpoint or "anycast (default)"))
-    return alive + dead
-
-
-# --------------------------------------------------------------------------- #
-# Thread 3: VERIFY - IP + quota in parallel
-# --------------------------------------------------------------------------- #
-
-def verify_after_connect():
-    """Run the IP lookup and the quota probe at the same time."""
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        ip_future = pool.submit(get_public_ip_fast)
-        quota_future = pool.submit(verify_opencode_deepseek)
         try:
-            ip = ip_future.result(timeout=8)
+            sock.close()
         except Exception:
-            ip = None
+            pass
+        raise
+
+
+def socks5_http_request(proxy_host, proxy_port, method: str, url: str,
+                        body: bytes = None, headers: dict = None, timeout: float = 10.0):
+    """Minimal HTTPS client over a SOCKS5 proxy (no third-party dependency)."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    host = parts.hostname
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+
+    raw = socks5_connect(proxy_host, proxy_port, host, port, timeout)
+    if parts.scheme == "https":
+        context = ssl.create_default_context()
+        raw = context.wrap_socket(raw, server_hostname=host)
+
+    lines = ["%s %s HTTP/1.1" % (method, path), "Host: %s" % host,
+             "User-Agent: OpenCode/2.2.2", "Connection: close"]
+    for key, value in (headers or {}).items():
+        lines.append("%s: %s" % (key, value))
+    if body is not None:
+        lines.append("Content-Length: %d" % len(body))
+    request = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b"")
+    raw.sendall(request)
+
+    chunks = []
+    raw.settimeout(timeout)
+    while True:
         try:
-            verdict, message = quota_future.result(timeout=8)
+            chunk = raw.recv(65536)
+        except (socket.timeout, ConnectionResetError, OSError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    raw.close()
+
+    response = b"".join(chunks)
+    head, _, payload = response.partition(b"\r\n\r\n")
+    head_text = head.decode("utf-8", "ignore")
+    status = 0
+    try:
+        status = int(head_text.split(" ")[1])
+    except Exception:
+        pass
+    return status, payload.decode("utf-8", "ignore")
+
+
+def verify_through_proxy(proxy_host: str, proxy_port: int):
+    ip = None
+    for url in IP_SERVICES:
+        try:
+            status, body = socks5_http_request(proxy_host, proxy_port, "GET", url, timeout=8)
+            candidate = (body or "").strip().split()[0] if body.strip() else ""
+            if candidate and ("." in candidate or ":" in candidate):
+                ip = candidate
+                break
         except Exception:
-            verdict, message = "error", "timeout"
+            continue
+
+    payload = json.dumps({
+        "model": OPENCODE_MODEL,
+        "messages": [{"role": "user", "content": "ping"}],
+    }).encode("utf-8")
+    try:
+        status, body = socks5_http_request(
+            proxy_host, proxy_port, "POST", OPENCODE_API, body=payload,
+            headers={"Content-Type": "application/json"}, timeout=12)
+        verdict, message = parse_verdict(status, body)
+    except Exception as exc:
+        verdict, message = "error", "proxy: %s" % exc
     return ip, verdict, message
 
 
 # --------------------------------------------------------------------------- #
-# Thread 2: TUNNEL - one owner of warp-cli, fastest candidate first
+# warp-plus backend
 # --------------------------------------------------------------------------- #
 
-def attempt_endpoint(warp_cli, endpoint, attempt_no: int):
-    label = endpoint or "anycast (default)"
-    say("  [2] Tunnel  : attempt %d -> %s" % (attempt_no, label))
+def find_warp_plus():
+    for path in (WARP_PLUS_EXE, shutil.which("warp-plus")):
+        if path and os.path.isfile(path):
+            return path
+    return None
 
-    execute_cycle(warp_cli, endpoint=endpoint, delete_registration=(attempt_no % 2 == 1))
 
-    if not wait_for_connection_fast(warp_cli):
-        say("      x no handshake via %s" % label)
+def download_warp_plus():
+    """Download + extract warp-plus once, with visible progress."""
+    if find_warp_plus():
+        return find_warp_plus()
+
+    os.makedirs(WARP_PLUS_DIR, exist_ok=True)
+    archive = os.path.join(WARP_PLUS_DIR, "warp-plus.zip")
+    step("DL", "downloading warp-plus (one time, ~7 MB) ...")
+    step("DL", "from %s" % WARP_PLUS_ZIP_URL)
+
+    try:
+        request = urllib.request.Request(WARP_PLUS_ZIP_URL, headers={"User-Agent": "warp-setup/6.0"})
+        with urllib.request.urlopen(request, timeout=30) as response, open(archive, "wb") as fh:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            last_print = 0.0
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                done += len(chunk)
+                if time.time() - last_print > 0.7:
+                    last_print = time.time()
+                    if total:
+                        step("DL", "  %5.1f%%  (%.1f / %.1f MB)" % (
+                            done * 100.0 / total, done / 1048576.0, total / 1048576.0))
+                    else:
+                        step("DL", "  %.1f MB" % (done / 1048576.0))
+    except Exception as exc:
+        step("DL", "download failed: %s" % exc)
         return None
 
-    say("  [3] Verify  : tunnel up, checking IP + quota ...")
-    ip, verdict, message = verify_after_connect()
-
-    if verdict == "ok":
-        say("      * quota OK on %s (IP %s)" % (label, ip or "?"))
-        return {"endpoint": endpoint, "ip": ip, "status": "ok", "message": message}
-
-    if verdict == "unknown" and ip:
-        say("      ~ reachable but unverified (%s) - kept as fallback" % message)
-        return {"endpoint": endpoint, "ip": ip, "status": "fallback", "message": message}
-
-    say("      x %s rejected (%s)" % (ip or label, message))
-    return None
-
-
-def activate(warp_cli, budget: int = DEFAULT_BUDGET_SEC):
-    """Keep trying until one candidate works. Returns the winning result dict."""
-    candidates = build_candidates(load_state())
-    ordered = prescreen(candidates)
-
-    deadline = time.time() + budget
-    fallback = None
-    attempt_no = 0
-
-    for round_index in range(MAX_ROUNDS):
-        if round_index:
-            say("\n  [*] Round %d: all candidates failed, retrying with fresh identities ..."
-                % (round_index + 1))
-            shuffled = list(ordered)
-            random.shuffle(shuffled)
-            ordered = shuffled
-
-        for endpoint in ordered:
-            if time.time() > deadline:
-                say("\n  [!] Time budget (%ds) exhausted." % budget)
-                break
-            attempt_no += 1
-            result = attempt_endpoint(warp_cli, endpoint, attempt_no)
-            if result and result["status"] == "ok":
-                return result
-            if result and result["status"] == "fallback" and fallback is None:
-                fallback = result
-
-        if fallback:
-            return fallback
-        if time.time() > deadline:
-            break
-
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# Teardown / stop
-# --------------------------------------------------------------------------- #
-
-def disconnect_tunnel() -> None:
-    if not _G_WARP_CLI:
-        return
     try:
-        subprocess.run([_G_WARP_CLI, "--accept-tos", "disconnect"],
-                       capture_output=True, timeout=5, creationflags=creation_flags())
+        with zipfile.ZipFile(archive) as bundle:
+            names = [n for n in bundle.namelist() if n.lower().endswith("warp-plus.exe")]
+            if not names:
+                step("DL", "archive does not contain warp-plus.exe")
+                return None
+            with bundle.open(names[0]) as src, open(WARP_PLUS_EXE, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        os.remove(archive)
+    except Exception as exc:
+        step("DL", "extract failed: %s" % exc)
+        return None
+
+    if os.path.isfile(WARP_PLUS_EXE):
+        step("DL", "ready: %s" % WARP_PLUS_EXE)
+        return WARP_PLUS_EXE
+    return None
+
+
+def stop_warp_plus() -> None:
+    global _G_WARP_PLUS_PROC
+    proc = _G_WARP_PLUS_PROC
+    _G_WARP_PLUS_PROC = None
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=4)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    # kill leftovers started from our folder only
+    try:
+        listing = subprocess.run(["tasklist", "/FI", "IMAGENAME eq warp-plus.exe", "/FO", "CSV", "/NH"],
+                                 capture_output=True, text=True,
+                                 creationflags=creation_flags(), timeout=3)
+        for line in listing.stdout.strip().splitlines():
+            parts = [c.strip('"') for c in line.split(",")]
+            if len(parts) >= 2 and parts[1].isdigit():
+                subprocess.run(["taskkill", "/F", "/PID", parts[1]],
+                               capture_output=True, creationflags=creation_flags(), timeout=3)
     except Exception:
         pass
 
 
+def port_is_open(host: str, port: int) -> bool:
+    try:
+        socket.create_connection((host, port), timeout=1.0).close()
+        return True
+    except Exception:
+        return False
+
+
+def start_warp_plus(exe: str, mode: str, port: int):
+    """Launch warp-plus in one of its modes; returns the Popen object."""
+    args = [exe, "-4", "-b", "127.0.0.1:%d" % port, "--cache-dir", WARP_PLUS_CACHE]
+    if mode == "psiphon":
+        args += ["--cfon", "--country", "US"]
+    elif mode == "gool":
+        args += ["--gool"]
+    elif mode == "scan":
+        args += ["--scan"]
+
+    log_path = os.path.join(WARP_PLUS_DIR, "warp-plus-%s.log" % mode)
+    try:
+        handle = open(log_path, "w", encoding="utf-8", errors="replace")
+    except Exception:
+        handle = subprocess.DEVNULL
+    creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    return subprocess.Popen(args, stdout=handle, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, creationflags=creation), log_path
+
+
+def warp_plus_activate(exe: str, port: int = WARP_PLUS_PORT):
+    """Try every warp-plus mode until one proxy really works."""
+    global _G_WARP_PLUS_PROC
+
+    modes = [("warp", "normal WARP"), ("psiphon", "WARP over Psiphon (US)"), ("gool", "WARP in WARP")]
+    for mode, label in modes:
+        if _G_STOP.is_set():
+            return None
+        step("W+", "trying mode: %s" % label)
+        try:
+            proc, log_path = start_warp_plus(exe, mode, port)
+        except Exception as exc:
+            step("W+", "cannot start: %s" % exc)
+            continue
+        _G_WARP_PLUS_PROC = proc
+
+        deadline = time.time() + WARP_PLUS_BOOT_TIMEOUT
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                step("W+", "process exited early (code %s)" % proc.returncode)
+                break
+            if port_is_open("127.0.0.1", port):
+                step("W+", "SOCKS5 is up on 127.0.0.1:%d - verifying ..." % port)
+                ip, verdict, message = verify_through_proxy("127.0.0.1", port)
+                if verdict == "ok":
+                    step("W+", "SUCCESS - IP %s via proxy" % (ip or "?"))
+                    return {"method": "warp-plus", "endpoint": mode, "ip": ip,
+                            "proxy": "socks5://127.0.0.1:%d" % port, "status": "ok",
+                            "message": message}
+                if verdict == "unknown" and ip:
+                    step("W+", "reachable but unverified (%s) - keeping as fallback" % message)
+                    return {"method": "warp-plus", "endpoint": mode, "ip": ip,
+                            "proxy": "socks5://127.0.0.1:%d" % port, "status": "fallback",
+                            "message": message}
+                step("W+", "rejected (%s: %s)" % (verdict, message))
+                break
+            time.sleep(1.0)
+        else:
+            step("W+", "timed out after %ds" % int(WARP_PLUS_BOOT_TIMEOUT))
+
+        stop_warp_plus()
+        try:
+            tail = ""
+            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                tail = "".join(fh.readlines()[-3:]).strip()
+            if tail:
+                for line in tail.splitlines():
+                    step("W+", "  log: %s" % line[:110])
+        except Exception:
+            pass
+
+    stop_warp_plus()
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Teardown
+# --------------------------------------------------------------------------- #
+
+def disconnect_tunnel() -> None:
+    if _G_WARP_CLI:
+        try:
+            subprocess.run([_G_WARP_CLI, "--accept-tos", "disconnect"],
+                           capture_output=True, timeout=5, creationflags=creation_flags())
+        except Exception:
+            pass
+
+
 def on_exit() -> None:
-    """Keep the winning tunnel alive; clean up only a half-finished attempt."""
-    global _G_SHUTDOWN_DONE
-    with _G_SHUTDOWN_LOCK:
-        if _G_SHUTDOWN_DONE:
+    global _G_EXIT_DONE
+    with _G_EXIT_LOCK:
+        if _G_EXIT_DONE:
             return
-        _G_SHUTDOWN_DONE = True
-
-    if not _G_ACTIVATED:
+        _G_EXIT_DONE = True
+    if not _G_KEEP_TUNNEL:
         disconnect_tunnel()
-
+        stop_warp_plus()
     try:
         if os.path.isfile(PID_LOCK_FILE):
             os.remove(PID_LOCK_FILE)
@@ -540,6 +747,8 @@ def setup_exit_handlers() -> None:
     atexit.register(on_exit)
 
     def _sig(_signum, _frame):
+        _G_STOP.set()
+        on_exit()
         sys.exit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -564,7 +773,6 @@ def setup_exit_handlers() -> None:
 
 
 def enforce_single_instance() -> None:
-    """One window only: a second click replaces the previous instance."""
     my_pid = os.getpid()
     try:
         parent_pid = os.getppid()
@@ -585,12 +793,11 @@ def enforce_single_instance() -> None:
             log("PID lock cleanup error: %s" % exc)
 
     try:
-        listing = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WarpSetup.exe",
-                                  "/FO", "CSV", "/NH"],
+        listing = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WarpSetup.exe", "/FO", "CSV", "/NH"],
                                  capture_output=True, text=True,
                                  creationflags=creation_flags(), timeout=3)
         for line in listing.stdout.strip().splitlines():
-            parts = [col.strip('"') for col in line.split(",")]
+            parts = [c.strip('"') for c in line.split(",")]
             if len(parts) >= 2 and parts[1].isdigit():
                 pid = int(parts[1])
                 if pid not in (my_pid, parent_pid):
@@ -613,193 +820,311 @@ def enforce_single_instance() -> None:
 # --------------------------------------------------------------------------- #
 
 def print_header() -> None:
-    say("\n" + "+" + "-" * 62 + "+")
-    say("|        OpenCode NoLimits v5.0 - One-Click Activation         |")
-    say("|     3-thread pipeline :  Scout  ->  Tunnel  ->  Verify        |")
-    say("+" + "-" * 62 + "+")
+    say("")
+    say("+" + "-" * 66 + "+")
+    say("|      OpenCode NoLimits v6.0 - Live Console (nothing closes)      |")
+    say("|      Cloudflare WARP  ->  fallback: warp-plus (if 2 fails)       |")
+    say("+" + "-" * 66 + "+")
+    say("")
 
 
-def print_done_card(result, window_will_close: bool) -> None:
-    endpoint = result["endpoint"] or "anycast (default)"
-    ip = result["ip"] or "unknown"
-    verdict = "quota reset & verified" if result["status"] == "ok" else "tunnel ready (unverified)"
-    say("\n+" + "-" * 62 + "+")
-    say("|                     ACTIVATION DONE                          |")
-    say("+" + "-" * 62 + "+")
-    say("|  Status   : %-49s|" % verdict)
-    say("|  New IP   : %-49s|" % ip)
-    say("|  Endpoint : %-49s|" % endpoint)
-    say("|  Protocol : %-49s|" % "WireGuard (full tunnel, low latency)")
-    say("|  Tunnel   : %-49s|" % ("stays running after this window closes"
-                                 if window_will_close else "stays running in background"))
-    say("+" + "-" * 62 + "+")
+def print_success_card(result) -> None:
+    ip = result.get("ip") or "unknown"
+    if result.get("method") == "warp-plus":
+        where = result.get("proxy", "")
+        protocol = "SOCKS5 proxy (warp-plus)"
+    else:
+        where = result.get("endpoint") or "anycast (default)"
+        protocol = "WireGuard full tunnel (warp-cli)"
+    status = "quota reset & verified" if result.get("status") == "ok" else "connected (unverified)"
+
+    say("")
+    say("+" + "-" * 66 + "+")
+    say("|                        ACTIVATION DONE                           |")
+    say("+" + "-" * 66 + "+")
+    say("|  Status   : %-52s |" % status)
+    say("|  New IP   : %-52s |" % ip)
+    say("|  Via      : %-52s |" % where[:51])
+    say("|  Protocol : %-52s |" % protocol)
+    say("|  Mode     : %-52s |" % ("stays ON - this window stays open" if _G_KEEP_TUNNEL
+                                 else "stays ON - window stays open"))
+    say("+" + "-" * 66 + "+")
+    say("")
 
 
-def print_failure_card() -> None:
-    say("\n+" + "-" * 62 + "+")
-    say("|                 ACTIVATION FAILED - TUNNEL OFF               |")
-    say("+" + "-" * 62 + "+")
-    say("|  No endpoint passed verification, so the tunnel was closed   |")
-    say("|  and your normal internet connection is restored.            |")
-    say("|  Try again later, or use --watch for continuous retries.     |")
-    say("+" + "-" * 62 + "+")
+def print_failed_round(warp_failures: int, next_action: str) -> None:
+    say("")
+    step("WARP", "round failed (consecutive failures: %d). Next: %s" % (warp_failures, next_action))
+    say("")
 
 
-def auto_close_window(seconds: float = 2.0, enabled: bool = True) -> None:
-    """Close the terminal window only if this process created it."""
-    if not enabled:
-        say("\n  (window stays open - --no-close / shared terminal)")
-        return
-    if not console_is_owned_by_us():
-        say("\n  (shared terminal detected - window left open)")
-        return
-    for remaining in range(int(seconds), 0, -1):
-        say("  Closing this window in %d ..." % remaining)
-        time.sleep(1.0)
+def describe_admin() -> str:
+    return "administrator" if is_admin() else "standard user"
 
 
 # --------------------------------------------------------------------------- #
-# Modes
+# Main workers
 # --------------------------------------------------------------------------- #
+
+def warp_round(warp_cli: str, workers: int = 1):
+    """ONE worker: prescreen, then try candidates serially until one passes."""
+    global _G_REPAIRED, _G_HINTED
+    state = load_state()
+    candidates = build_candidates(state)
+
+    step("WARP", "prescreening %d endpoints (%d read-only probes) ..." % (len(candidates), workers))
+    ordered, scores = prescreen(candidates, workers=workers)
+    for endpoint in ordered[:4]:
+        score = scores.get(endpoint)
+        step("WARP", "  candidate %-22s %s" % (endpoint or "anycast (default)",
+                                               "%4d ms" % int(score * 1000) if score else "unreachable"))
+
+    attempt_no = 0
+    for endpoint in ordered:
+        if _G_STOP.is_set():
+            return None
+        attempt_no += 1
+        label = endpoint or "anycast (default)"
+        step("WARP", "attempt %d/%d -> %s" % (attempt_no, len(ordered), label))
+
+        execute_cycle(warp_cli, endpoint=endpoint, delete_registration=(attempt_no % 2 == 1))
+
+        if not wait_for_connection_fast(warp_cli):
+            status = warp_status_text(warp_cli)
+            step("WARP", "  no handshake (%s)" % status[:90])
+            if "registration missing" in status.lower() and is_admin() and not _G_REPAIRED:
+                _G_REPAIRED = True
+                status = repair_registration(warp_cli)
+                if "connected" in status.lower() or "disconnected" in status.lower():
+                    step("WARP", "  retrying after repair ...")
+                    execute_cycle(warp_cli, endpoint=endpoint, delete_registration=False)
+                    if wait_for_connection_fast(warp_cli):
+                        step("WARP", "  tunnel up after repair, verifying ...")
+                        ip, verdict, message = verify_ip_and_quota()
+                        if verdict in ("ok", "unknown") and ip:
+                            return {"method": "warp", "endpoint": endpoint, "ip": ip,
+                                    "status": "ok" if verdict == "ok" else "fallback",
+                                    "message": message}
+            elif "registration missing" in status.lower() and not is_admin() and not _G_HINTED:
+                _G_HINTED = True
+                step("WARP", "  hint: run as Administrator so the service can be repaired")
+            continue
+
+        step("WARP", "  tunnel up, verifying IP + quota ...")
+        ip, verdict, message = verify_ip_and_quota()
+
+        if verdict == "ok":
+            step("WARP", "  OK - IP %s, quota available" % (ip or "?"))
+            return {"method": "warp", "endpoint": endpoint, "ip": ip,
+                    "status": "ok", "message": message}
+        if verdict == "unknown" and ip:
+            step("WARP", "  reachable but unverified (%s)" % message)
+            return {"method": "warp", "endpoint": endpoint, "ip": ip,
+                    "status": "fallback", "message": message}
+        step("WARP", "  rejected - IP %s (%s)" % (ip or "?", message))
+
+    return None
+
+
+def monitor(warp_cli, result) -> None:
+    """After success: keep watching, and re-activate when the quota comes back."""
+    step("MON", "monitoring every 12s - Ctrl+C to stop")
+    while not _G_STOP.is_set():
+        time.sleep(12)
+        if _G_STOP.is_set():
+            return
+        if result.get("method") == "warp":
+            if not warp_is_connected(warp_cli):
+                step("MON", "tunnel dropped - reactivating")
+                return
+            verdict, message = verify_opencode_direct()
+        else:
+            proxy = result.get("proxy", "")
+            if not proxy:
+                return
+            host, port = proxy.replace("socks5://", "").rsplit(":", 1)
+            try:
+                _, verdict, message = verify_through_proxy(host, int(port))
+            except Exception as exc:
+                verdict, message = "error", str(exc)
+        if verdict == "limited":
+            step("MON", "quota reached again (%s) - rotating" % message)
+            return
+        if verdict == "error":
+            step("MON", "verification error (%s)" % message)
+
+
+def run_forever(warp_cli, args) -> int:
+    global _G_KEEP_TUNNEL
+
+    warp_failures = 0
+    cycle = 0
+
+    while not _G_STOP.is_set():
+        if args.cycles and cycle >= args.cycles:
+            step("CYCLE", "reached --cycles %d, stopping (tunnel stays as it is)" % args.cycles)
+            return 0
+        cycle += 1
+        say("")
+        say("-" * 68)
+        step("CYCLE", "#%d  (%s, uptime %s)" % (cycle, describe_admin(),
+                                                time.strftime("%H:%M:%S")))
+        say("-" * 68)
+
+        result = warp_round(warp_cli, workers=args.probe_threads)
+
+        if result:
+            _G_KEEP_TUNNEL = result.get("status") == "ok"
+            save_state(endpoint=result.get("endpoint"), ip=result.get("ip"),
+                       method=result.get("method"), proxy=result.get("proxy"))
+            print_success_card(result)
+            if args.no_monitor:
+                return 0
+            monitor(warp_cli, result)
+            continue
+
+        warp_failures += 1
+
+        if args.no_fallback:
+            print_failed_round(warp_failures, "retrying WARP")
+            time.sleep(4)
+            continue
+
+        if warp_failures >= 2:
+            say("")
+            step("W+", "WARP failed %d rounds in a row -> switching to warp-plus" % warp_failures)
+            exe = find_warp_plus() or download_warp_plus()
+            if not exe:
+                step("W+", "warp-plus unavailable, back to WARP")
+                warp_failures = 0
+                time.sleep(4)
+                continue
+
+            plus_result = warp_plus_activate(exe, args.warp_plus_port)
+            if plus_result:
+                _G_KEEP_TUNNEL = True
+                save_state(method="warp-plus", ip=plus_result.get("ip"),
+                           proxy=plus_result.get("proxy"), endpoint=plus_result.get("endpoint"))
+                print_success_card(plus_result)
+                if args.no_monitor:
+                    return 0
+                monitor(warp_cli, plus_result)
+                continue
+
+            step("W+", "all warp-plus modes failed")
+            warp_failures = 0
+
+        print_failed_round(warp_failures, "retrying WARP in 4s" if warp_failures else "warp-plus next")
+        time.sleep(4)
+
+    return 0
+
 
 def mode_stop() -> int:
     global _G_WARP_CLI
     _G_WARP_CLI = find_warp_cli()
-    say("\n  Disconnecting Cloudflare WARP tunnel ...")
+    say("")
+    step("STOP", "disconnecting WARP tunnel ...")
     disconnect_tunnel()
-    disable_cloudflare_startup_and_tray()
-    say("  [OK] Tunnel closed, normal internet restored.\n")
-    return 0
-
-
-def mode_watch(warp_cli, current=None) -> int:
-    """Legacy sentinel: keep the window open and self-heal on limits."""
-    say("\n  [WATCH] Window stays open. Ctrl+C or close it to stop monitoring.")
-    if current is None:
-        current = activate(warp_cli)
-    while True:
-        time.sleep(12)
-        try:
-            if not warp_is_connected(warp_cli):
-                say("\n  [!] Tunnel dropped - reconnecting ...")
-                current = activate(warp_cli, budget=60)
-                continue
-            verdict, message = verify_opencode_deepseek()
-            if verdict == "limited":
-                say("\n  [!] Quota reached (%s) - rotating IP ..." % message)
-                current = activate(warp_cli, budget=60)
-        except KeyboardInterrupt:
-            return 0
-        except Exception as exc:
-            log("Watch loop: %s" % exc)
-    return 0
-
-
-def mode_activate(warp_cli, args) -> int:
-    global _G_ACTIVATED
-
-    print_header()
-
-    initial_ip = get_public_ip_fast()
-    if initial_ip:
-        say("  Current public IP : %s" % initial_ip)
-
-    say("  Budget            : %ds (keeps trying until one passes)\n" % args.timeout)
-
-    # Fast path: the tunnel may already be up from a previous click.
-    result = None
-    if warp_is_connected(warp_cli):
-        say("  [*] Tunnel already connected - verifying current quota first ...")
-        ip, verdict, message = verify_after_connect()
-        if verdict == "ok":
-            result = {"endpoint": load_state().get("good_endpoint"), "ip": ip,
-                      "status": "ok", "message": message}
-            say("      * current tunnel is already unlocked (IP %s)" % (ip or "?"))
-        else:
-            say("      ~ current tunnel is not usable (%s) - rotating" % message)
-
-    if result is None:
-        result = activate(warp_cli, budget=args.timeout)
-
-    if not result:
-        disconnect_tunnel()
-        print_failure_card()
-        _G_ACTIVATED = False
-        if args.watch:
-            return mode_watch(warp_cli)
-        auto_close_window(4.0, enabled=not args.no_close)
-        return 3
-
-    save_state(result["endpoint"], result["ip"])
-    _G_ACTIVATED = True
-    print_done_card(result, window_will_close=not args.no_close)
-
-    if args.watch:
-        return mode_watch(warp_cli, result)
-
-    auto_close_window(2.0, enabled=not args.no_close)
+    step("STOP", "stopping warp-plus ...")
+    stop_warp_plus()
+    disable_cloudflare_tray()
+    try:
+        if os.path.isfile(PID_LOCK_FILE):
+            os.remove(PID_LOCK_FILE)
+    except Exception:
+        pass
+    step("STOP", "done - normal internet restored")
     return 0
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="WarpSetup",
-        description="One-click Cloudflare WARP activation with 3-thread pipeline.",
+        description="Live, never-closing WARP activation with warp-plus fallback.",
     )
-    parser.add_argument("--stop", action="store_true",
-                        help="disconnect the tunnel and restore normal internet")
-    parser.add_argument("--watch", action="store_true",
-                        help="keep the window open and auto-heal on limits")
-    parser.add_argument("--no-close", action="store_true",
-                        help="do not close the terminal window after activation")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_BUDGET_SEC,
-                        help="max seconds to keep trying (default %d)" % DEFAULT_BUDGET_SEC)
+    parser.add_argument("--stop", action="store_true", help="stop tunnels and exit")
+    parser.add_argument("--no-fallback", action="store_true", help="never use warp-plus")
+    parser.add_argument("--no-elevate", action="store_true", help="do not ask for UAC")
+    parser.add_argument("--probe-threads", type=int, default=1,
+                        help="read-only latency probe threads; 1 = strictly one worker (default 1)")
+    parser.add_argument("--warp-plus-port", type=int, default=WARP_PLUS_PORT,
+                        help="local SOCKS5 port for warp-plus (default %d)" % WARP_PLUS_PORT)
+    parser.add_argument("--cycles", type=int, default=0,
+                        help="stop after N WARP cycles (0 = never stop, default)")
+    parser.add_argument("--no-monitor", action="store_true",
+                        help="do not keep watching after a success (useful for testing)")
     return parser
 
 
 def main(argv=None) -> int:
-    global _G_WARP_CLI
+    global _G_WARP_CLI, _G_KEEP_TUNNEL
 
     args = build_parser().parse_args(argv)
 
     if args.stop:
-        if not is_admin() and not request_admin_elevation():
-            say("[X] Administrator privileges are required.")
-            return 1
         return mode_stop()
 
-    if not is_admin():
-        say("[!] Requesting Administrator privileges (UAC) ...")
-        if request_admin_elevation():
+    if not is_admin() and not args.no_elevate:
+        step("ADM", "requesting Administrator privileges (UAC) ...")
+        if request_admin_elevation(list(sys.argv[1:]) if argv is None else argv):
             return 0
-        say("[X] Administrator privileges are required to manage the tunnel.")
-        time.sleep(4)
-        return 1
+        step("ADM", "continuing without elevation (limited cleanup)")
 
     enforce_single_instance()
-    disable_cloudflare_startup_and_tray()
+    print_header()
 
     warp_cli = find_warp_cli()
     if not warp_cli:
-        say("[X] warp-cli.exe not found - install Cloudflare WARP first.")
-        say("    https://1.1.1.1/")
-        time.sleep(6)
+        step("ERR", "warp-cli.exe not found - install Cloudflare WARP from https://1.1.1.1/")
+        step("ERR", "warp-plus fallback can still be used, continuing ...")
+    else:
+        _G_WARP_CLI = warp_cli
+        ensure_service_started()
+        step("WARP", "status: %s" % warp_status_text(warp_cli)[:110])
+
+    disable_cloudflare_tray()
+    if is_admin():
+        remove_cloudflare_autostart()
+
+    setup_exit_handlers()
+
+    initial_ip = get_public_ip_fast()
+    step("NET", "current public IP: %s" % (initial_ip or "unknown"))
+    step("NET", "window stays open until you stop it (Ctrl+C)")
+
+    if not warp_cli:
+        # no WARP client: go straight to warp-plus
+        exe = find_warp_plus() or download_warp_plus()
+        if exe:
+            args.no_fallback = True  # avoid double handling
+            result = warp_plus_activate(exe, args.warp_plus_port)
+            if result:
+                _G_KEEP_TUNNEL = True
+                save_state(method="warp-plus", ip=result.get("ip"),
+                           proxy=result.get("proxy"), endpoint=result.get("endpoint"))
+                print_success_card(result)
+                monitor(warp_cli, result)
+                return 0
+        step("ERR", "nothing to run. Install Cloudflare WARP or place warp-plus.exe next to this tool.")
         return 2
 
-    _G_WARP_CLI = warp_cli
-    setup_exit_handlers()
-    ensure_service_started()
-
-    try:
-        return mode_activate(warp_cli, args)
-    except KeyboardInterrupt:
-        return 130
-    except Exception as exc:
-        log("Fatal: %s" % exc)
-        say("\n[X] Unexpected error: %s" % exc)
-        time.sleep(6)
-        return 1
+    return run_forever(warp_cli, args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        on_exit()
+        sys.exit(0)
+    except Exception as exc:
+        log("Fatal: %s" % exc)
+        say("")
+        step("ERR", "unexpected error: %s" % exc)
+        step("ERR", "window stays open. Press Enter to close.")
+        try:
+            input()
+        except Exception:
+            time.sleep(10)
+        sys.exit(1)
