@@ -1,55 +1,58 @@
-# OpenCode NoLimits (v3.0) — Ultra Background Engine
+# OpenCode NoLimits (v4.0) — Ultra Background Tunnel & Limit Reset Engine
 
-> أداة مطوّرة ذكية وسريعة للغاية لضبط اتصال Cloudflare WARP ببروتوكول WireGuard فائق الاستقرار، وتجديد عنوان IP وفك حدود الاستخدام (Rate Limit) في OpenCode تلقائياً وبشكل صامت في الخلفية مع وضع المراقبة الذاتي (Sentinel Mode).
-
----
-
-## المميزات الجديدة في الإصدار v3.0
-
-1. **أيقونة داكنة جديدة كلياً (Modern Dark Mode Icon):**
-   * تصميم وضع ليلي بحواف دائرية ناعمة، يجمع بين رمز اللانهاية وأقواس البرمجة `{}` مع لمسات نيون ذهبية وزرقاء بتقنية 3D متوافقة مع شاشات الـ High-DPI والتاسك بار الداكن.
-
-2. **وضع الحراسة والمراقبة المستمرة (Active Sentinel Mode):**
-   * التيرمينال يظل مستمعاً ونشطاً في الخلفية.
-   * في حال انقطاع النفق أو استهلاك ليمت الـ IP أثناء عملك، تكتشف الأداة ذلك ذاتياً وتعيد تدوير الـ IP فوراً وبشكل صامت بدون أي تدخل منك.
-
-3. **إغلاق النفق تلقائياً عند قفل التيرمينال (Graceful Exit):**
-   * بمجرد إغلاق نافذة التيرمينال (زر X) أو الضغط على `Ctrl + C`، يتم فصل نفق الـ WARP تلقائياً وإعادة اتصال الإنترنت لحالته الطبيعية دون أن يظل معلقاً في الخلفية.
-
-4. **منع كلاود فلير من البدء مع ويندوز أو الظهور في التاسك بار:**
-   * تقوم الأداة بحذف قيود بدء التشغيل التلقائي من الـ Registry وإغلاق برنامج الواجهة الصوري لكلاود فلير نهائياً، ليعمل كل شيء بصمت تام وبدون أي نوافذ منبثقة مزعجة للمستخدم.
-
-5. **الإغلاق التلقائي للنسخ السابقة (Single-Instance):**
-   * إذا شغّلت البرنامج مرة أخرى لتغيير الـ IP، يتم إغلاق النافذة والعملية القديمة فوراً وبدء عملية جديدة نظيفة.
-
-6. **الحفاظ التام على المحادثات السابقة:**
-   * لا يتم حذف أو تعديل أي محادثة أو مشروع في OpenCode نهائياً.
+> A high-performance, background utility for Windows that optimizes Cloudflare WARP with the WireGuard protocol, rotates Anycast endpoints to renew public IPs, and resets OpenCode free usage limits (e.g. DeepSeek) with an active self-healing monitor (Sentinel Mode).
 
 ---
 
-## طريقة الاستخدام
+## What's New in v4.0
 
-1. شغّل ملف `dist\WarpSetup.exe` (أو سكربت `warp_setup.py`).
-2. وافق على صلاحيات المسؤول (UAC) عند طلبها.
-3. ستقوم الأداة بتجديد الـ IP واختبار كوتة DeepSeek وعرض البطاقة الاحترافية:
+* **100% English Terminal Interface:**
+  * Clean, universally compatible ASCII/Unicode cards and status indicators without RTL/font distortion in Windows consoles.
+* **Strict Single-Instance Enforcement:**
+  * Clicking the executable icon multiple times automatically closes the previous instance and window, ensuring exactly one active monitor window.
+* **Console Keep-Alive (No Disappearing Window):**
+  * Fixed process parent tracking so PyInstaller bootloader is never killed; the window remains open and visible in front of you.
+* **Ultra-Minimalist Dark Mode Icon:**
+  * Clean, bold cyan infinity loop over a rounded obsidian disc, optimized for high-DPI screens and Windows 11 taskbars. Provided in `icon.svg`, `icon.png`, and `icon.ico`.
+* **Active Sentinel Mode (Self-Healing Background Monitor):**
+  * Continuously monitors tunnel health every 12 seconds. If packet loss occurs or OpenCode reaches a rate-limit, it automatically rotates to a clean IP in the background without user intervention.
+* **Graceful Tunnel Teardown:**
+  * Closing the terminal window (X) or pressing `Ctrl + C` immediately disconnects the tunnel and restores normal internet connectivity.
+* **Suppresses Cloudflare Tray & Startup:**
+  * Prevents Cloudflare from auto-starting on Windows boot and hides the tray application completely.
+* **Preserves OpenCode History:**
+  * Never touches or deletes your previous chats, projects, or local databases.
+
+---
+
+## How to Use
+
+1. Download `WarpSetup.exe` from the [Latest Release](https://github.com/X5Coder/OpenCode-NoLimits/releases/latest).
+2. Run `WarpSetup.exe` (accept the one-time UAC prompt).
+3. The tool will configure WireGuard, rotate to an unlocked IP, and display:
    ```text
-   ╭──────────────────────────────────────────────────────────╮
-   │                     OPENCODE UNLOCKED                    │
-   ├──────────────────────────────────────────────────────────┤
-   │  ✔ الحالة    : تم فك الليمت بنجاح والاتصال مستقر         │
-   │  ◈ الـ IP    : 188.114.97.xxx                           │
-   │  ◈ البروتوكول: WireGuard (نفق فائق السرعة وبدون بطء)    │
-   │  ◈ الموديل   : DeepSeek جاهز للرد الفوري في OpenCode     │
-   │  ◈ المحادثات : جميع محادثاتك وسجلاتك محفوظة بالكامل     │
-   ╰──────────────────────────────────────────────────────────╯
+   ╭────────────────────────────────────────────────────────────╮
+   │                     OPENCODE UNLOCKED                      │
+   ├────────────────────────────────────────────────────────────┤
+   │  ✔ Status    : Limit reset successful & tunnel active      │
+   │  ◈ New IP    : 188.114.97.xxx                              │
+   │  ◈ Protocol  : WireGuard (Ultra-low latency, full tunnel)  │
+   │  ◈ OpenCode  : DeepSeek free model is ready to respond     │
+   │  ◈ History   : All previous chats & projects preserved     │
+   ╰────────────────────────────────────────────────────────────╯
    ```
-4. اترك التيرمينال مفتوحاً أثناء عملك في OpenCode ليتولى تجديد الاتصال ذاتياً عند اللزوم، وعند الانتهاء أغلق النافذة فقط!
+4. Keep the window open while working in OpenCode for automatic self-healing. When finished, simply close the window to disconnect the tunnel.
 
 ---
 
-## البناء من المصدر (Build EXE)
+## Build from Source
 
 ```bat
 build_exe.bat
 ```
-الناتج: `dist\WarpSetup.exe`
+Or directly using Python:
+```powershell
+python -m pip install -r requirements.txt
+python -m PyInstaller WarpSetup.spec
+```
+Binary output: `dist\WarpSetup.exe`

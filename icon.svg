@@ -1,71 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
     <!-- Background Gradient -->
-    <radialGradient id="bgGrad" cx="50%" cy="30%" r="75%">
-      <stop offset="0%" stop-color="#1e2430"/>
-      <stop offset="60%" stop-color="#0f131a"/>
-      <stop offset="100%" stop-color="#080a0e"/>
-    </radialGradient>
-
-    <!-- Border Glow Gradient -->
-    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#00f0ff" stop-opacity="0.8"/>
-      <stop offset="50%" stop-color="#3b82f6" stop-opacity="0.3"/>
-      <stop offset="100%" stop-color="#10b981" stop-opacity="0.8"/>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#030712"/>
     </linearGradient>
 
-    <!-- Core Infinity / Node Gradient -->
-    <linearGradient id="coreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+    <!-- Symbol Gradient (Clean Electric Cyan to Sky Blue) -->
+    <linearGradient id="symbolGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#00f0ff"/>
-      <stop offset="50%" stop-color="#38bdf8"/>
-      <stop offset="100%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
     </linearGradient>
 
-    <!-- Accent Gold / Sparkle Gradient -->
-    <linearGradient id="sparkGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#fef08a"/>
-      <stop offset="100%" stop-color="#f59e0b"/>
-    </linearGradient>
-
-    <!-- Soft Glow Filter -->
-    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="8" result="blur"/>
+    <!-- Subtle Glow Filter -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
       <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
-
-    <filter id="subtleShadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#000000" flood-opacity="0.6"/>
     </filter>
   </defs>
 
-  <!-- Outer Rounded Squircle / Circle Background -->
-  <rect x="20" y="20" width="472" height="472" rx="140" ry="140"
-        fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="6"
-        filter="url(#subtleShadow)"/>
+  <!-- Circular Dark Disc -->
+  <rect x="24" y="24" width="464" height="464" rx="140" ry="140" 
+        fill="url(#bg)" stroke="#1f2937" stroke-width="3"/>
 
-  <!-- Subtle Inner Ambient Rim -->
-  <rect x="26" y="26" width="460" height="460" rx="134" ry="134"
-        fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="2"/>
+  <!-- Minimalist, Pure Infinity Loop (Zero clutter, bold and iconic) -->
+  <path d="M 256 256 C 210 180 130 180 130 256 C 130 332 210 332 256 256 C 302 180 382 180 382 256 C 382 332 302 332 256 256 Z" 
+        fill="none" stroke="url(#symbolGrad)" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"
+        filter="url(#glow)"/>
 
-  <!-- Left Code Bracket < -->
-  <path d="M 120 216 L 82 256 L 120 296" 
-        fill="none" stroke="#38bdf8" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"
-        stroke-opacity="0.85" filter="url(#neonGlow)"/>
-
-  <!-- Right Code Bracket > -->
-  <path d="M 392 216 L 430 256 L 392 296" 
-        fill="none" stroke="#10b981" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"
-        stroke-opacity="0.85" filter="url(#neonGlow)"/>
-
-  <!-- Central Infinity Warp Loop -->
-  <path d="M 256 256 C 215 195 150 195 150 256 C 150 317 215 317 256 256 C 297 195 362 195 362 256 C 362 317 297 317 256 256 Z" 
-        fill="none" stroke="url(#coreGrad)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"
-        filter="url(#neonGlow)"/>
-
-  <!-- Center Quantum Core Sparkle -->
-  <circle cx="256" cy="256" r="9" fill="#ffffff" filter="url(#neonGlow)"/>
-  
-  <!-- Subtle Top-Right Accent Spark -->
-  <polygon points="362,190 366,202 378,206 366,210 362,222 358,210 346,206 358,202"
-           fill="url(#sparkGrad)" opacity="0.95"/>
+  <!-- Crisp Core Center Light -->
+  <circle cx="256" cy="256" r="8" fill="#ffffff"/>
 </svg>
