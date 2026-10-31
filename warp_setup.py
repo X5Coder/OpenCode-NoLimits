@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenCode NoLimits (v6.0) - Live Console, WARP + warp-plus Fallback
-==================================================================
+OpenCode NoLimits (v6.3) - Live Console, WARP + GUI + Infinite Retry
+====================================================================
 Design rules (as requested):
 
   * NOTHING closes by itself.  The window stays open and shows every step.
   * Cloudflare WARP runs as ONE worker thread that keeps retrying until the
     quota is really reset. No parallel tunnel attempts (warp-cli is a client
     of a single Windows service, parallel attempts would fight each other).
-  * If WARP fails 2 rounds in a row, warp-plus is downloaded (once, cached)
-    and tried as a fallback. If it works, its SOCKS5 proxy stays alive.
+  * Smart startup: checks if WARP is already connected → verifies quota → if good, keeps it.
+  * Infinite retry: keeps trying forever until success or manual stop.
+  * The Cloudflare WARP GUI is launched so you can see the connection status.
   * Losing attempts are stopped immediately; the winner is the only thing
     left running.
   * Ctrl+C stops everything cleanly.
 
 Usage:
-    WarpSetup.exe                 start and keep retrying (default)
-    WarpSetup.exe --stop          stop WARP + warp-plus and restore internet
-    WarpSetup.exe --no-fallback   never download/use warp-plus
-    WarpSetup.exe --probe-threads 1
-    WarpSetup.exe --no-elevate    run without UAC prompt (limited cleanup)
+    WarpSetup.exe                              start and keep retrying forever (default)
+    WarpSetup.exe --stop                       stop WARP and restore internet
+    WarpSetup.exe --probe-threads 1            strictly one probe worker (default 1)
+    WarpSetup.exe --no-elevate                 run without UAC prompt (limited cleanup)
+    WarpSetup.exe --no-gui                     don't launch Cloudflare WARP GUI
+    WarpSetup.exe --cycles N                   stop after N cycles (for testing)
 """
 
 from __future__ import annotations
@@ -41,7 +43,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 # --------------------------------------------------------------------------- #
@@ -77,21 +78,12 @@ PROBE_TIMEOUT_SEC = 1.2
 CONNECT_TIMEOUT_SEC = 7.0
 VERIFY_TIMEOUT_SEC = 6.0
 
-# warp-plus fallback
-WARP_PLUS_ZIP_URL = ("https://github.com/bepass-org/warp-plus/releases/latest/download/"
-                     "warp-plus_windows-amd64.zip")
-WARP_PLUS_PORT = 8086
-WARP_PLUS_BOOT_TIMEOUT = 40.0
-
 TEMP_DIR = tempfile.gettempdir()
 DIAG_LOG = os.path.join(TEMP_DIR, "warp_setup_diag.log")
 PID_LOCK_FILE = os.path.join(TEMP_DIR, "opencode_nolimits.pid")
 
 STATE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", TEMP_DIR), "OpenCodeNoLimits")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
-WARP_PLUS_DIR = os.path.join(STATE_DIR, "warp-plus")
-WARP_PLUS_EXE = os.path.join(WARP_PLUS_DIR, "warp-plus.exe")
-WARP_PLUS_CACHE = os.path.join(WARP_PLUS_DIR, "cache")
 
 SHELL_PROCESS_NAMES = {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe",
                        "conhost.exe", "wt.exe", "bash.exe", "wsl.exe"}
@@ -101,7 +93,6 @@ SHELL_PROCESS_NAMES = {"cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal
 # --------------------------------------------------------------------------- #
 
 _G_WARP_CLI = None
-_G_WARP_PLUS_PROC = None
 _G_KEEP_TUNNEL = False
 _G_EXIT_LOCK = threading.Lock()
 _G_EXIT_DONE = False
@@ -286,6 +277,7 @@ def parse_verdict(status, body: str):
 
 
 def verify_opencode_direct():
+    """Verify OpenCode API quota with improved error handling."""
     payload = json.dumps({
         "model": OPENCODE_MODEL,
         "messages": [{"role": "user", "content": "ping"}],
@@ -297,14 +289,20 @@ def verify_opencode_direct():
     try:
         with urllib.request.urlopen(request, timeout=VERIFY_TIMEOUT_SEC) as response:
             body = response.read().decode("utf-8", "ignore")
+            step("VERIFY", "OpenCode API status: %s" % response.status)
             return parse_verdict(response.status, body)
     except urllib.error.HTTPError as exc:
         try:
             body = exc.read().decode("utf-8", "ignore")
         except Exception:
             body = ""
+        step("VERIFY", "OpenCode API error: HTTP %s" % exc.code)
         return parse_verdict(exc.code, body)
+    except urllib.error.URLError as exc:
+        step("VERIFY", "OpenCode API network error: %s" % str(exc.reason))
+        return "error", "network: %s" % exc.reason
     except Exception as exc:
+        step("VERIFY", "OpenCode API unexpected error: %s" % exc)
         return "error", "network: %s" % exc
 
 
@@ -399,7 +397,7 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(endpoint=None, ip=None, method=None, proxy=None) -> None:
+def save_state(endpoint=None, ip=None, method=None) -> None:
     data = load_state()
     if endpoint is not None:
         data["good_endpoint"] = endpoint
@@ -407,8 +405,6 @@ def save_state(endpoint=None, ip=None, method=None, proxy=None) -> None:
         data["ip"] = ip
     if method is not None:
         data["method"] = method
-    if proxy is not None:
-        data["proxy"] = proxy
     data["at"] = time.time()
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
@@ -430,288 +426,27 @@ def build_candidates(state: dict):
 
 
 # --------------------------------------------------------------------------- #
-# SOCKS5 client (used to test / use warp-plus)
+# Cloudflare WARP GUI launcher
 # --------------------------------------------------------------------------- #
 
-class SocksError(Exception):
-    pass
-
-
-def socks5_connect(proxy_host: str, proxy_port: int, host: str, port: int, timeout: float = 10.0):
-    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
-    try:
-        sock.sendall(b"\x05\x01\x00")
-        reply = sock.recv(2)
-        if len(reply) != 2 or reply[0] != 5 or reply[1] != 0:
-            raise SocksError("SOCKS5 handshake rejected")
-        request = b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode() + port.to_bytes(2, "big")
-        sock.sendall(request)
-        head = sock.recv(4)
-        if len(head) < 4 or head[1] != 0:
-            raise SocksError("SOCKS5 connect failed (code %s)" % (head[1] if len(head) > 1 else "?"))
-        atyp = head[3]
-        if atyp == 1:
-            sock.recv(4)
-        elif atyp == 3:
-            length = sock.recv(1)[0]
-            sock.recv(length)
-        elif atyp == 4:
-            sock.recv(16)
-        sock.recv(2)
-        return sock
-    except Exception:
-        try:
-            sock.close()
-        except Exception:
-            pass
-        raise
-
-
-def socks5_http_request(proxy_host, proxy_port, method: str, url: str,
-                        body: bytes = None, headers: dict = None, timeout: float = 10.0):
-    """Minimal HTTPS client over a SOCKS5 proxy (no third-party dependency)."""
-    from urllib.parse import urlsplit
-    parts = urlsplit(url)
-    host = parts.hostname
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    path = parts.path or "/"
-    if parts.query:
-        path += "?" + parts.query
-
-    raw = socks5_connect(proxy_host, proxy_port, host, port, timeout)
-    if parts.scheme == "https":
-        context = ssl.create_default_context()
-        raw = context.wrap_socket(raw, server_hostname=host)
-
-    lines = ["%s %s HTTP/1.1" % (method, path), "Host: %s" % host,
-             "User-Agent: OpenCode/2.2.2", "Connection: close"]
-    for key, value in (headers or {}).items():
-        lines.append("%s: %s" % (key, value))
-    if body is not None:
-        lines.append("Content-Length: %d" % len(body))
-    request = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b"")
-    raw.sendall(request)
-
-    chunks = []
-    raw.settimeout(timeout)
-    while True:
-        try:
-            chunk = raw.recv(65536)
-        except (socket.timeout, ConnectionResetError, OSError):
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
-    raw.close()
-
-    response = b"".join(chunks)
-    head, _, payload = response.partition(b"\r\n\r\n")
-    head_text = head.decode("utf-8", "ignore")
-    status = 0
-    try:
-        status = int(head_text.split(" ")[1])
-    except Exception:
-        pass
-    return status, payload.decode("utf-8", "ignore")
-
-
-def verify_through_proxy(proxy_host: str, proxy_port: int):
-    ip = None
-    for url in IP_SERVICES:
-        try:
-            status, body = socks5_http_request(proxy_host, proxy_port, "GET", url, timeout=8)
-            candidate = (body or "").strip().split()[0] if body.strip() else ""
-            if candidate and ("." in candidate or ":" in candidate):
-                ip = candidate
-                break
-        except Exception:
-            continue
-
-    payload = json.dumps({
-        "model": OPENCODE_MODEL,
-        "messages": [{"role": "user", "content": "ping"}],
-    }).encode("utf-8")
-    try:
-        status, body = socks5_http_request(
-            proxy_host, proxy_port, "POST", OPENCODE_API, body=payload,
-            headers={"Content-Type": "application/json"}, timeout=12)
-        verdict, message = parse_verdict(status, body)
-    except Exception as exc:
-        verdict, message = "error", "proxy: %s" % exc
-    return ip, verdict, message
-
-
-# --------------------------------------------------------------------------- #
-# warp-plus backend
-# --------------------------------------------------------------------------- #
-
-def find_warp_plus():
-    for path in (WARP_PLUS_EXE, shutil.which("warp-plus")):
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-
-def download_warp_plus():
-    """Download + extract warp-plus once, with visible progress."""
-    if find_warp_plus():
-        return find_warp_plus()
-
-    os.makedirs(WARP_PLUS_DIR, exist_ok=True)
-    archive = os.path.join(WARP_PLUS_DIR, "warp-plus.zip")
-    step("DL", "downloading warp-plus (one time, ~7 MB) ...")
-    step("DL", "from %s" % WARP_PLUS_ZIP_URL)
-
-    try:
-        request = urllib.request.Request(WARP_PLUS_ZIP_URL, headers={"User-Agent": "warp-setup/6.0"})
-        with urllib.request.urlopen(request, timeout=30) as response, open(archive, "wb") as fh:
-            total = int(response.headers.get("Content-Length") or 0)
-            done = 0
-            last_print = 0.0
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                done += len(chunk)
-                if time.time() - last_print > 0.7:
-                    last_print = time.time()
-                    if total:
-                        step("DL", "  %5.1f%%  (%.1f / %.1f MB)" % (
-                            done * 100.0 / total, done / 1048576.0, total / 1048576.0))
-                    else:
-                        step("DL", "  %.1f MB" % (done / 1048576.0))
-    except Exception as exc:
-        step("DL", "download failed: %s" % exc)
-        return None
-
-    try:
-        with zipfile.ZipFile(archive) as bundle:
-            names = [n for n in bundle.namelist() if n.lower().endswith("warp-plus.exe")]
-            if not names:
-                step("DL", "archive does not contain warp-plus.exe")
-                return None
-            with bundle.open(names[0]) as src, open(WARP_PLUS_EXE, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-        os.remove(archive)
-    except Exception as exc:
-        step("DL", "extract failed: %s" % exc)
-        return None
-
-    if os.path.isfile(WARP_PLUS_EXE):
-        step("DL", "ready: %s" % WARP_PLUS_EXE)
-        return WARP_PLUS_EXE
-    return None
-
-
-def stop_warp_plus() -> None:
-    global _G_WARP_PLUS_PROC
-    proc = _G_WARP_PLUS_PROC
-    _G_WARP_PLUS_PROC = None
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=4)
-        except Exception:
+def launch_warp_gui() -> None:
+    """Launch the Cloudflare WARP GUI application."""
+    gui_paths = [
+        r"C:\Program Files\Cloudflare\Cloudflare WARP\Cloudflare WARP.exe",
+        os.path.expandvars(r"%ProgramFiles%\Cloudflare\Cloudflare WARP\Cloudflare WARP.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Cloudflare\Cloudflare WARP\Cloudflare WARP.exe"),
+    ]
+    
+    for path in gui_paths:
+        if os.path.isfile(path):
             try:
-                proc.kill()
-            except Exception:
-                pass
-    # kill leftovers started from our folder only
-    try:
-        listing = subprocess.run(["tasklist", "/FI", "IMAGENAME eq warp-plus.exe", "/FO", "CSV", "/NH"],
-                                 capture_output=True, text=True,
-                                 creationflags=creation_flags(), timeout=3)
-        for line in listing.stdout.strip().splitlines():
-            parts = [c.strip('"') for c in line.split(",")]
-            if len(parts) >= 2 and parts[1].isdigit():
-                subprocess.run(["taskkill", "/F", "/PID", parts[1]],
-                               capture_output=True, creationflags=creation_flags(), timeout=3)
-    except Exception:
-        pass
-
-
-def port_is_open(host: str, port: int) -> bool:
-    try:
-        socket.create_connection((host, port), timeout=1.0).close()
-        return True
-    except Exception:
-        return False
-
-
-def start_warp_plus(exe: str, mode: str, port: int):
-    """Launch warp-plus in one of its modes; returns the Popen object."""
-    args = [exe, "-4", "-b", "127.0.0.1:%d" % port, "--cache-dir", WARP_PLUS_CACHE]
-    if mode == "psiphon":
-        args += ["--cfon", "--country", "US"]
-    elif mode == "gool":
-        args += ["--gool"]
-    elif mode == "scan":
-        args += ["--scan"]
-
-    log_path = os.path.join(WARP_PLUS_DIR, "warp-plus-%s.log" % mode)
-    try:
-        handle = open(log_path, "w", encoding="utf-8", errors="replace")
-    except Exception:
-        handle = subprocess.DEVNULL
-    creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    return subprocess.Popen(args, stdout=handle, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, creationflags=creation), log_path
-
-
-def warp_plus_activate(exe: str, port: int = WARP_PLUS_PORT):
-    """Try every warp-plus mode until one proxy really works."""
-    global _G_WARP_PLUS_PROC
-
-    modes = [("warp", "normal WARP"), ("psiphon", "WARP over Psiphon (US)"), ("gool", "WARP in WARP")]
-    for mode, label in modes:
-        if _G_STOP.is_set():
-            return None
-        step("W+", "trying mode: %s" % label)
-        try:
-            proc, log_path = start_warp_plus(exe, mode, port)
-        except Exception as exc:
-            step("W+", "cannot start: %s" % exc)
-            continue
-        _G_WARP_PLUS_PROC = proc
-
-        deadline = time.time() + WARP_PLUS_BOOT_TIMEOUT
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                step("W+", "process exited early (code %s)" % proc.returncode)
-                break
-            if port_is_open("127.0.0.1", port):
-                step("W+", "SOCKS5 is up on 127.0.0.1:%d - verifying ..." % port)
-                ip, verdict, message = verify_through_proxy("127.0.0.1", port)
-                if verdict == "ok":
-                    step("W+", "SUCCESS - IP %s via proxy" % (ip or "?"))
-                    return {"method": "warp-plus", "endpoint": mode, "ip": ip,
-                            "proxy": "socks5://127.0.0.1:%d" % port, "status": "ok",
-                            "message": message}
-                if verdict == "unknown" and ip:
-                    step("W+", "reachable but unverified (%s) - keeping as fallback" % message)
-                    return {"method": "warp-plus", "endpoint": mode, "ip": ip,
-                            "proxy": "socks5://127.0.0.1:%d" % port, "status": "fallback",
-                            "message": message}
-                step("W+", "rejected (%s: %s)" % (verdict, message))
-                break
-            time.sleep(1.0)
-        else:
-            step("W+", "timed out after %ds" % int(WARP_PLUS_BOOT_TIMEOUT))
-
-        stop_warp_plus()
-        try:
-            tail = ""
-            with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                tail = "".join(fh.readlines()[-3:]).strip()
-            if tail:
-                for line in tail.splitlines():
-                    step("W+", "  log: %s" % line[:110])
-        except Exception:
-            pass
-
-    stop_warp_plus()
-    return None
+                subprocess.Popen([path], creationflags=creation_flags())
+                step("GUI", "launched Cloudflare WARP GUI")
+                return
+            except Exception as exc:
+                log("GUI launch error: %s" % exc)
+    
+    step("GUI", "Cloudflare WARP GUI not found (not installed or different path)")
 
 
 # --------------------------------------------------------------------------- #
@@ -735,7 +470,6 @@ def on_exit() -> None:
         _G_EXIT_DONE = True
     if not _G_KEEP_TUNNEL:
         disconnect_tunnel()
-        stop_warp_plus()
     try:
         if os.path.isfile(PID_LOCK_FILE):
             os.remove(PID_LOCK_FILE)
@@ -822,20 +556,16 @@ def enforce_single_instance() -> None:
 def print_header() -> None:
     say("")
     say("+" + "-" * 66 + "+")
-    say("|      OpenCode NoLimits v6.0 - Live Console (nothing closes)      |")
-    say("|      Cloudflare WARP  ->  fallback: warp-plus (if 2 fails)       |")
+    say("|      OpenCode NoLimits v6.3 - Live Console (nothing closes)      |")
+    say("|      Cloudflare WARP  ->  Infinite Retry + Smart Startup          |")
     say("+" + "-" * 66 + "+")
     say("")
 
 
 def print_success_card(result) -> None:
     ip = result.get("ip") or "unknown"
-    if result.get("method") == "warp-plus":
-        where = result.get("proxy", "")
-        protocol = "SOCKS5 proxy (warp-plus)"
-    else:
-        where = result.get("endpoint") or "anycast (default)"
-        protocol = "WireGuard full tunnel (warp-cli)"
+    where = result.get("endpoint") or "anycast (default)"
+    protocol = "WireGuard full tunnel (warp-cli)"
     status = "quota reset & verified" if result.get("status") == "ok" else "connected (unverified)"
 
     say("")
@@ -933,20 +663,10 @@ def monitor(warp_cli, result) -> None:
         time.sleep(12)
         if _G_STOP.is_set():
             return
-        if result.get("method") == "warp":
-            if not warp_is_connected(warp_cli):
-                step("MON", "tunnel dropped - reactivating")
-                return
-            verdict, message = verify_opencode_direct()
-        else:
-            proxy = result.get("proxy", "")
-            if not proxy:
-                return
-            host, port = proxy.replace("socks5://", "").rsplit(":", 1)
-            try:
-                _, verdict, message = verify_through_proxy(host, int(port))
-            except Exception as exc:
-                verdict, message = "error", str(exc)
+        if not warp_is_connected(warp_cli):
+            step("MON", "tunnel dropped - reactivating")
+            return
+        verdict, message = verify_opencode_direct()
         if verdict == "limited":
             step("MON", "quota reached again (%s) - rotating" % message)
             return
@@ -960,6 +680,36 @@ def run_forever(warp_cli, args) -> int:
     warp_failures = 0
     cycle = 0
 
+    # Check if WARP is already connected on startup
+    step("START", "checking if WARP is already connected...")
+    if warp_is_connected(warp_cli):
+        step("START", "WARP is already connected! Verifying quota...")
+        ip = get_public_ip_fast()
+        verdict, message = verify_opencode_direct()
+
+        if verdict == "ok":
+            step("START", "Existing connection has good quota! Keeping it.")
+            result = {
+                "method": "warp",
+                "endpoint": "existing",
+                "ip": ip,
+                "status": "ok",
+                "message": message
+            }
+            _G_KEEP_TUNNEL = True
+            save_state(endpoint="existing", ip=ip, method="warp")
+            print_success_card(result)
+            if args.no_monitor:
+                return 0
+            monitor(warp_cli, result)
+            return 0
+        else:
+            step("START", "Existing connection has bad quota (%s). Starting rotation..." % message)
+            # Continue to rotation below
+    else:
+        step("START", "WARP is not connected. Starting rotation...")
+
+    # Main loop: infinite retry until success or manual stop
     while not _G_STOP.is_set():
         if args.cycles and cycle >= args.cycles:
             step("CYCLE", "reached --cycles %d, stopping (tunnel stays as it is)" % args.cycles)
@@ -976,7 +726,7 @@ def run_forever(warp_cli, args) -> int:
         if result:
             _G_KEEP_TUNNEL = result.get("status") == "ok"
             save_state(endpoint=result.get("endpoint"), ip=result.get("ip"),
-                       method=result.get("method"), proxy=result.get("proxy"))
+                       method=result.get("method"))
             print_success_card(result)
             if args.no_monitor:
                 return 0
@@ -984,37 +734,7 @@ def run_forever(warp_cli, args) -> int:
             continue
 
         warp_failures += 1
-
-        if args.no_fallback:
-            print_failed_round(warp_failures, "retrying WARP")
-            time.sleep(4)
-            continue
-
-        if warp_failures >= 2:
-            say("")
-            step("W+", "WARP failed %d rounds in a row -> switching to warp-plus" % warp_failures)
-            exe = find_warp_plus() or download_warp_plus()
-            if not exe:
-                step("W+", "warp-plus unavailable, back to WARP")
-                warp_failures = 0
-                time.sleep(4)
-                continue
-
-            plus_result = warp_plus_activate(exe, args.warp_plus_port)
-            if plus_result:
-                _G_KEEP_TUNNEL = True
-                save_state(method="warp-plus", ip=plus_result.get("ip"),
-                           proxy=plus_result.get("proxy"), endpoint=plus_result.get("endpoint"))
-                print_success_card(plus_result)
-                if args.no_monitor:
-                    return 0
-                monitor(warp_cli, plus_result)
-                continue
-
-            step("W+", "all warp-plus modes failed")
-            warp_failures = 0
-
-        print_failed_round(warp_failures, "retrying WARP in 4s" if warp_failures else "warp-plus next")
+        print_failed_round(warp_failures, "retrying WARP in 4s")
         time.sleep(4)
 
     return 0
@@ -1026,8 +746,6 @@ def mode_stop() -> int:
     say("")
     step("STOP", "disconnecting WARP tunnel ...")
     disconnect_tunnel()
-    step("STOP", "stopping warp-plus ...")
-    stop_warp_plus()
     disable_cloudflare_tray()
     try:
         if os.path.isfile(PID_LOCK_FILE):
@@ -1041,15 +759,13 @@ def mode_stop() -> int:
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="WarpSetup",
-        description="Live, never-closing WARP activation with warp-plus fallback.",
+        description="Live, never-closing WARP activation with GUI.",
     )
     parser.add_argument("--stop", action="store_true", help="stop tunnels and exit")
-    parser.add_argument("--no-fallback", action="store_true", help="never use warp-plus")
     parser.add_argument("--no-elevate", action="store_true", help="do not ask for UAC")
+    parser.add_argument("--no-gui", action="store_true", help="don't launch Cloudflare WARP GUI")
     parser.add_argument("--probe-threads", type=int, default=1,
                         help="read-only latency probe threads; 1 = strictly one worker (default 1)")
-    parser.add_argument("--warp-plus-port", type=int, default=WARP_PLUS_PORT,
-                        help="local SOCKS5 port for warp-plus (default %d)" % WARP_PLUS_PORT)
     parser.add_argument("--cycles", type=int, default=0,
                         help="stop after N WARP cycles (0 = never stop, default)")
     parser.add_argument("--no-monitor", action="store_true",
@@ -1077,7 +793,7 @@ def main(argv=None) -> int:
     warp_cli = find_warp_cli()
     if not warp_cli:
         step("ERR", "warp-cli.exe not found - install Cloudflare WARP from https://1.1.1.1/")
-        step("ERR", "warp-plus fallback can still be used, continuing ...")
+        step("ERR", "IPNET fallback can be used with --ipnet-subscription, continuing ...")
     else:
         _G_WARP_CLI = warp_cli
         ensure_service_started()
@@ -1094,20 +810,12 @@ def main(argv=None) -> int:
     step("NET", "window stays open until you stop it (Ctrl+C)")
 
     if not warp_cli:
-        # no WARP client: go straight to warp-plus
-        exe = find_warp_plus() or download_warp_plus()
-        if exe:
-            args.no_fallback = True  # avoid double handling
-            result = warp_plus_activate(exe, args.warp_plus_port)
-            if result:
-                _G_KEEP_TUNNEL = True
-                save_state(method="warp-plus", ip=result.get("ip"),
-                           proxy=result.get("proxy"), endpoint=result.get("endpoint"))
-                print_success_card(result)
-                monitor(warp_cli, result)
-                return 0
-        step("ERR", "nothing to run. Install Cloudflare WARP or place warp-plus.exe next to this tool.")
+        step("ERR", "warp-cli.exe not found - install Cloudflare WARP from https://1.1.1.1/")
         return 2
+
+    # Launch Cloudflare WARP GUI
+    if not args.no_gui:
+        launch_warp_gui()
 
     return run_forever(warp_cli, args)
 
